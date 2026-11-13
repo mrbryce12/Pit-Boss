@@ -1,0 +1,37 @@
+name: Pit Boss
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:          # adds a "Run workflow" button for testing
+
+permissions:
+  contents: write             # lets the bot save state.json (its memory)
+
+concurrency:
+  group: pitboss
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check MFL and post to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MFL_API_KEY: ${{ secrets.MFL_API_KEY }}
+        run: python pitboss.py
+
+      - name: Save memory (state.json)
+        run: |
+          git config user.name "pit-boss-bot"
+          git config user.email "pit-boss-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "Pit Boss: update state"
+          git push
