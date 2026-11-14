@@ -11,6 +11,8 @@ Status key: ⬜ to do · 🔄 in progress · ✅ done
 - ✅ `/playoffs` – playoff picture if the season ended today (was backlog #6)
 - ✅ `/potentialpoints` – PP rankings for all teams + draft lottery balls (was backlog #7)
 
+- ✅ AI chat: @Pit Boss answers questions (live MFL data, rule book, trade opinions, NFL chat), persona file, learns via trainer-approved memories (was backlog #9 rules + #8 trade opinions, partial)
+
 ## Backlog
 | # | Item | Status | Notes |
 |---|---|---|---|
@@ -25,3 +27,5 @@ Status key: ⬜ to do · 🔄 in progress · ✅ done
 | 9 | Ability to spit back league rules | ⬜ | `/rules <topic>` from MFL league settings + league rules page/constitution. |
 | 10 | Fix `/stats` position list | ⬜ | Uses QB/PK/PN/Def, but this league's positions are TMQB/TMPK/TMPN – those searches return nothing. |
 | 11 | Auto-post Roster Alerts | ⬜ | Optional: post `/rosteralerts` results to Discord before Sunday kickoff. |
+| 12 | AI: plug Mike's dynasty trade values into trade opinions | ⬜ | Export values to a CSV the AI can read. |
+| 13 | AI: link Discord users to their MFL teams | ⬜ | Trainers can /teach "Mike runs X" today; could become a /iam command. |

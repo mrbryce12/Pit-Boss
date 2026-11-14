@@ -1,2 +1,3 @@
 discord.py>=2.3
 tzdata  # time zone data for Windows
+anthropic>=0.40  # AI chat (Claude API)

@@ -117,6 +117,9 @@ def tag(p):
 
 mfl = MFL()
 intents = discord.Intents.default()
+# Lets Pit Boss read the text of messages where he is tagged (incl. his role) or replied to.
+# Requires: Developer Portal > Pit Boss > Bot > "Message Content Intent" switched ON.
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -842,4 +845,14 @@ async def on_ready():
           f"Leave this window open.")
 
 
-client.run(TOKEN)
+# ---- AI chat: @Pit Boss questions, personality, learning (see pitboss_ai.py) ----
+import pitboss_ai
+pitboss_ai.setup(client, tree, mfl, globals())
+
+try:
+    client.run(TOKEN)
+except discord.errors.PrivilegedIntentsRequired:
+    print("\n*** Pit Boss could not start: turn ON 'Message Content Intent' in the Discord "
+          "Developer Portal (your Pit Boss app > Bot > Privileged Gateway Intents), "
+          "click Save Changes, then restart. ***\n")
+

@@ -18,6 +18,10 @@ The people maintaining this are not professional developers. Keep code simple, s
 | `pitboss.py` | **Transaction feed.** Polls MFL transactions and posts new trades and adds/drops/waiver wins to `#league-activity` via a Discord **webhook**. Standard library only. | GitHub Actions, every 15 min (`.github/workflows/pitboss.yml`) |
 | `state.json` | Feed's memory of already-posted transactions (hashes). Committed back to the repo by the workflow. **Don't delete or ignore it.** | written by the workflow |
 | `pitboss_bot.py` | **Slash-command bot** (`discord.py`): `/standings`, `/roster`, `/player`, `/stats`, `/topscorers`, `/rosteralerts`, `/rosterviolations`, `/playoffs`, `/potentialpoints`. Uses the Pit Boss bot account (Developer Portal application). | Always-on machine (currently Mike's Windows PC) |
+| `pitboss_ai.py` | **AI chat.** Answers @mentions and replies with Claude (Haiku default, Sonnet for trade questions) using tool calls into live MFL data and the rule book. Learns via memories; trainer commands `/teach`, `/memories`, `/approve`, `/forget`, `/aiusage`. Hooked in at the bottom of `pitboss_bot.py`. | Same machine as the bot |
+| `personality/persona.md` | Pit Boss backstory + voice. Re-read on every message (edit + Pull = live, no restart). | |
+| `personality/league_rules.md` | Commissioner notes added to the rule book as section 99. | |
+| `data/` (git-ignored) | `memories.json` (learned facts), `usage.json` (AI cost tracking), `rulebook_cache.txt`. Lives only on the bot machine – copy it if the bot moves. | bot machine |
 | `start_pitboss.bat` | Windows launcher: installs requirements, runs the bot, auto-restarts if it stops. | Windows PC |
 | `requirements.txt` | Python packages for the command bot. | |
 | `TODO.md` | Feature backlog. | |
@@ -25,6 +29,7 @@ The people maintaining this are not professional developers. Keep code simple, s
 ## Secrets (never commit these)
 - `DISCORD_WEBHOOK_URL` – GitHub Actions secret, used by `pitboss.py`.
 - `MFL_API_KEY` – optional GitHub secret; only needed if the league becomes private.
+- **Anthropic API key** – in `anthropic_key.txt` next to `pitboss_bot.py` (git-ignored) or the `ANTHROPIC_API_KEY` env var. No key = AI chat off, slash commands still work.
 - Discord **bot token** – in `token.txt` next to `pitboss_bot.py` (git-ignored) or the `DISCORD_BOT_TOKEN` env var on a server.
 
 If a token or webhook URL ever gets committed or pasted somewhere public, reset it immediately (Discord Developer Portal → Bot → Reset Token; or delete/recreate the webhook).
@@ -51,6 +56,16 @@ Base: `{HOST}/{YEAR}/export?TYPE=<type>&L=27743&JSON=1` – public for this leag
 - **Draft lottery (rule book §14b):** non-playoff draft order is by Potential Points (`pp`); the 8 lowest-PP non-playoff teams (ranks 25–32) get 8,7,…,1 lottery balls for picks 1.01–1.08. `/potentialpoints` uses `playoff_picture()` to exclude teams currently in the playoffs.
 - Other useful exports for the backlog: `tradeBait`, `injuries`, `nflSchedule`, `schedule`, `rules`, `liveScoring`.
 - Send a descriptive User-Agent; don't poll faster than needed (cache 5–10 min).
+
+## AI chat notes
+- Models: `claude-haiku-5-5` (default) and `claude-sonnet-5-5` (when the message matches `TRADE_WORDS`). Settings at the top of `pitboss_ai.py` (daily cap, cooldown, allowed channels).
+- Tools call the same `mfl` cache and helpers as the slash commands (`find_team`, `playoff_picture`, `games_back`, …) via the `globals()` passed to `setup()`. Keep those helper names stable or update `pitboss_ai.Brain`.
+- Rule book: fetched from https://godfatherfantasyfootball.com/about-us (that site also links other Godfather leagues – only the text from "Blue Chip Dynasty - 32 Team" to the last "Leaguesafe Site" is kept), refreshed daily, split into sections 1–20 (+99 commissioner notes). Sections contain their own numbered lists, so a line only starts a section if it is the next number and ≤70 chars.
+- Uses the privileged **Message Content Intent** (`intents.message_content = True` in `pitboss_bot.py`; must also be ON in the Developer Portal > Bot). Without it, messages that tag the bot's *role* (Discord offers both the bot and its auto-created role as "@Pit Boss") or replies without a ping arrive with empty text. `is_bot_role()` treats the bot's role like a direct mention.
+- Start/sit: `start_sit_research` combines MFL (owner, weekly + season scores, `projectedScores`, `nflSchedule` matchup) with **RotoWire** injuries (`https://www.rotowire.com/football/tables/injury-report.php?team=ALL&pos=ALL`, JSON, cached 1 h) and **Ourlads** depth charts (all teams on one page: `https://www.ourlads.com/nfldepthcharts/depthcharts.aspx`, cached 6 h; per-team page `/nfldepthcharts/depthchart/<CODE>` is the fallback). Ourlads sections: rows reading OFF/DEF/ST = ACTIVE depth chart, PS = Practice Squad, RES = Reserves (IR/PUP/NFI). Player names carry an acquisition code (`U/Atl`, `SF26`, `23/1`) that `strip_key()` removes. Ourlads team codes differ from MFL: ARZ, GB, JAX, KC, RAM, LV, NE, NO, SF, TB (`OURLADS_TEAM`). House rule: never recommend a practice-squad, reserve-list or unlisted player over a healthy active one.
+- Both sites are scraped politely (cached, on demand only). If either changes its page layout, the tool says it could not load and the AI falls back to MFL injury data.
+- Limits: `USER_DAILY_LIMIT` (5/person/day, trainers exempt via `TRAINERS_UNLIMITED`), `DAILY_REQUEST_LIMIT` (300/server/day), `USER_COOLDOWN_SECONDS`. Counts are per Central-time day in `data/usage.json`; `/aiusage` shows today's counts by person.
+- Memories from non-trainers are saved as *pending* until a trainer runs `/approve`. Only approved memories go into the prompt.
 
 ## Conventions
 - Times shown in US Central.

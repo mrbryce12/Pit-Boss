@@ -1,5 +1,6 @@
 # Secrets - never commit
 token.txt
+anthropic_key.txt
 .env
 
 # Python clutter
@@ -7,3 +8,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Pit Boss runtime data (memories, usage, rule book cache) - stays on the bot machine
+data/

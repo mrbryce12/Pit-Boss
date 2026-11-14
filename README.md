@@ -20,5 +20,11 @@ Working with Claude on this? Have it read [`CLAUDE.md`](CLAUDE.md) first. Featur
 
 On a Linux/Mac server: `pip install -r requirements.txt`, set `DISCORD_BOT_TOKEN`, run `python pitboss_bot.py`.
 
+## AI chat (optional)
+1. Create an API key at console.anthropic.com (add a small prepaid balance).
+2. Put it in `anthropic_key.txt` next to `pitboss_bot.py` and restart `start_pitboss.bat`.
+3. In Discord: `@Pit Boss who leads the league?` – or reply to any Pit Boss message.
+4. Change his personality in `personality/persona.md`. Trainers (Manage Server or the "Pit Boss Trainer" role) use `/teach`, `/memories`, `/approve`, `/forget`, `/aiusage`.
+
 ## Never commit secrets
-`token.txt` is git-ignored. Webhook URL and API keys go in GitHub Secrets only.
+`token.txt` and `anthropic_key.txt` are git-ignored. Webhook URL and API keys go in GitHub Secrets only.
