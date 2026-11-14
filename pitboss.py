@@ -5,6 +5,7 @@ Runs on a schedule (GitHub Actions). Each run:
   1. Pulls recent transactions from MyFantasyLeague
   2. Skips anything it has already posted (remembered in state.json)
   3. Posts the new ones to the #league-activity Discord webhook
+  4. Posts trade bait changes (players/picks added or removed, new "looking for" note)
 
 Settings come from GitHub "Secrets" (never put the webhook URL in this file):
   DISCORD_WEBHOOK_URL  - required
@@ -33,6 +34,7 @@ POST_TRADES = True
 POST_ADDS_DROPS = True     # free agent pickups and waiver claims
 POST_IR = False            # IR moves (set True if the league wants them)
 POST_TAXI = False          # taxi squad moves
+POST_TRADE_BAIT = True     # post when a team adds/removes players on its MFL trade bait
 
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 API_KEY = os.environ.get("MFL_API_KEY", "").strip()
@@ -172,24 +174,24 @@ def format_txn(t, players, teams):
         else:
             bid = ""
             dropped = ids(parts[1]) if len(parts) > 1 else []
-        lines = [f"➕ **Added:** {players.get(p, f"Player #{p}")}" for p in added]
+        lines = [f"➕ **Added:** {players.get(p, 'Player #' + p)}" for p in added]
         if bid:
             lines[-1:] = [l + f" — ${bid} bid" for l in lines[-1:]]
-        lines += [f"➖ **Dropped:** {players.get(p, f"Player #{p}")}" for p in dropped]
+        lines += [f"➖ **Dropped:** {players.get(p, 'Player #' + p)}" for p in dropped]
         label = {"FREE_AGENT": "Free Agent Move", "WAIVER": "Waiver Claim",
                  "BBID_WAIVER": "Blind Bid Waiver Won"}[typ]
         return {"title": f"📋 {label} — {team}", "description": "\n".join(lines),
                 "color": 0x3498DB, "footer": {"text": when(t["timestamp"])}}
 
     if typ == "IR" and POST_IR:
-        lines = [f"🚑 **To IR:** {players.get(p, f"Player #{p}")}" for p in ids(t.get("deactivated"))]
-        lines += [f"✅ **Off IR:** {players.get(p, f"Player #{p}")}" for p in ids(t.get("activated"))]
+        lines = [f"🚑 **To IR:** {players.get(p, 'Player #' + p)}" for p in ids(t.get("deactivated"))]
+        lines += [f"✅ **Off IR:** {players.get(p, 'Player #' + p)}" for p in ids(t.get("activated"))]
         return {"title": f"IR Move — {team}", "description": "\n".join(lines),
                 "color": 0xE74C3C, "footer": {"text": when(t["timestamp"])}}
 
     if typ == "TAXI" and POST_TAXI:
-        lines = [f"🚕 **To taxi:** {players.get(p, f"Player #{p}")}" for p in ids(t.get("demoted"))]
-        lines += [f"⬆️ **Promoted:** {players.get(p, f"Player #{p}")}" for p in ids(t.get("promoted"))]
+        lines = [f"🚕 **To taxi:** {players.get(p, 'Player #' + p)}" for p in ids(t.get("demoted"))]
+        lines += [f"⬆️ **Promoted:** {players.get(p, 'Player #' + p)}" for p in ids(t.get("promoted"))]
         return {"title": f"Taxi Squad Move — {team}", "description": "\n".join(lines),
                 "color": 0x95A5A6, "footer": {"text": when(t["timestamp"])}}
 
@@ -207,6 +209,98 @@ def player_ids_in(t):
 
 
 # ---- Main ------------------------------------------------------------------
+# ---- Trade bait updates ----------------------------------------------------
+def bait_snapshot():
+    """{franchise_id: {"ts", "items", "note"}} from MFL's tradeBait export."""
+    data = mfl("tradeBait")
+    out = {}
+    for b in as_list((data.get("tradeBaits") or {}).get("tradeBait")):
+        out[b["franchise_id"]] = {
+            "ts": b.get("timestamp", ""),
+            "items": [x for x in (b.get("willGiveUp") or "").split(",") if x],
+            "note": (b.get("inExchangeFor") or "").strip(),
+        }
+    return out
+
+
+def check_trade_bait(state):
+    """Post a card for every team whose trade bait changed since the last run."""
+    if not POST_TRADE_BAIT:
+        return 0
+    now = bait_snapshot()
+    before = state.get("bait")
+    state["bait"] = now
+    if before is None:          # first run with this feature: remember, don't flood
+        print(f"Trade bait: remembered {len(now)} teams' lists.")
+        return 0
+    changed = []
+    for fid in sorted(set(before) | set(now)):
+        old = before.get(fid, {"items": [], "note": "", "ts": ""})
+        new = now.get(fid, {"items": [], "note": "", "ts": ""})
+        added = [x for x in new["items"] if x not in old["items"]]
+        removed = [x for x in old["items"] if x not in new["items"]]
+        note_changed = new["note"] != old["note"] and new["note"]
+        if added or removed or note_changed:
+            changed.append((fid, added, removed, new, note_changed))
+    if not changed:
+        return 0
+    teams = franchise_names()
+    codes = sorted({c for _, a, r, nw, _ in changed for c in a + r + nw["items"] if c.isdigit()})
+    players = player_names(codes) if codes else {}
+    contracts = {}
+    try:
+        for fr in as_list(mfl("rosters")["rosters"]["franchise"]):
+            for e in as_list(fr.get("player")):
+                contracts[e["id"]] = e
+    except Exception:
+        pass
+
+    def label(code):
+        if code.startswith(("FP_", "DP_", "BB_")):
+            return asset(code, players, teams)
+        txt = players.get(code, f"Player #{code}")
+        c = contracts.get(code)
+        if c and c.get("salary"):
+            txt += f" — ${float(c['salary']):,.2f}"
+            if c.get("contractInfo"):          # contractInfo = years REMAINING
+                txt += f", {c['contractInfo']} yr left"
+        return txt
+
+    def group_of(code):
+        if code.startswith(("FP_", "DP_", "BB_")):
+            return "Picks"
+        name = players.get(code, "")
+        return name.rsplit("(", 1)[-1].split()[0] if "(" in name else "Other"
+
+    order = ["TMQB", "QB", "RB", "WR", "TE", "TMPK", "PK", "TMPN", "PN",
+             "DE", "DT", "LB", "CB", "S", "Other", "Picks"]
+    for fid, added, removed, new, note_changed in changed:
+        groups = {}
+        for code in new["items"]:
+            line = ("🟢 " if code in added else "") + label(code)
+            groups.setdefault(group_of(code), []).append(line)
+        fields = []
+        for grp in sorted(groups, key=lambda g: (order.index(g) if g in order else 50, g)):
+            text = "\n".join(groups[grp])
+            while text:                                  # Discord: 1024 chars per field
+                chunk, text = text[:1024], text[1024:]
+                fields.append({"name": grp, "value": chunk, "inline": False})
+        if removed:
+            fields.append({"name": "Taken off the block",
+                           "value": "\n".join(map(label, removed))[:1024], "inline": False})
+        if new["items"] or new["note"]:
+            desc = f"**Comments / looking for:** {new['note'] or '—'}"
+            if added:
+                desc += "\n🟢 = newly added"
+        else:
+            desc = "Took everything off the block."
+        post({"title": f"🎣 Trade Bait Update — {teams.get(fid, fid)}",
+              "description": desc, "color": 0xE67E22, "fields": fields[:25],
+              "footer": {"text": f"{len(new['items'])} player(s)/pick(s) on the block"}})
+    print(f"Trade bait: posted {len(changed)} update(s).")
+    return len(changed)
+
+
 def main():
     if not WEBHOOK:
         sys.exit("DISCORD_WEBHOOK_URL secret is missing.")
@@ -224,6 +318,7 @@ def main():
     if not state.get("initialized"):
         state["seen"] = [key_for(t) for t in txns]
         state["initialized"] = True
+        check_trade_bait(state)
         save_state(state)
         post({"title": "🎰 The Pit Boss is on the floor",
               "description": "I'll post Blue Chip trades and roster moves here as they happen.",
@@ -233,6 +328,8 @@ def main():
 
     if not new:
         print("No new transactions.")
+        check_trade_bait(state)
+        save_state(state)
         return
 
     teams = franchise_names()
@@ -246,8 +343,9 @@ def main():
             post(embed)
             posted += 1
         state["seen"].append(key_for(t))
-    save_state(state)
     print(f"Posted {posted} of {len(new)} new transactions.")
+    check_trade_bait(state)
+    save_state(state)
 
 
 if __name__ == "__main__":
