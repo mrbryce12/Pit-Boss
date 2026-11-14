@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+from typing import Optional
 from discord import app_commands
 
 # ---- League settings -------------------------------------------------------
@@ -1336,6 +1337,98 @@ async def capspace(inter: discord.Interaction):
                      + (f" · ${dead:,.2f} dead" if dead else ""))
     await send_chunked(inter, f"💰 Cap Space — {YEAR} (cap ${cap:,.2f})", lines,
                        footer="Cap used = active salaries + 25% of taxi/IR + dead money (matches MFL).")
+
+
+# ---- /faab -------------------------------------------------------------------
+# FAAB money = salary cap room. Activating a player from IR moves his cap hit from
+# 25% (includeIRWithSalary) to 100%, so room after activations is lower.
+#   "required" = IR players who are no longer IR-eligible (same test as /ircheck)
+#   "all IR"   = every player on IR activated
+def faab_numbers(fr, league, adjustments, players, injuries):
+    cap = money(league.get("salaryCapAmount"))
+    ir_pct = money(league.get("includeIRWithSalary") or 100) / 100
+    pay = team_payroll(fr, league, adjustments)
+    must = {pid for pid, _ in ir_ineligible([fr], players, injuries).get(fr["id"], [])}
+    ir = [e for e in as_list(fr.get("player")) if e.get("status") == "INJURED_RESERVE"]
+    extra_all = sum(money(e.get("salary")) * (1 - ir_pct) for e in ir)
+    extra_must = sum(money(e.get("salary")) * (1 - ir_pct) for e in ir if e["id"] in must)
+    active = sum(1 for e in as_list(fr.get("player")) if e.get("status", "ROSTER") == "ROSTER")
+    return {"cap": cap, "pay": pay, "room": cap - pay, "room_must": cap - pay - extra_must,
+            "room_all": cap - pay - extra_all, "ir": ir, "must": must, "active": active}
+
+
+def room_text(x):
+    return f"-${abs(x):,.2f} 🚨" if x < 0 else f"${x:,.2f}"
+
+
+@tree.command(name="faab", description="FAAB / cap room now and after IR activations (pick a team, or leave blank for all)")
+@app_commands.describe(team="Start typing a team name (blank = every team)")
+@app_commands.autocomplete(team=team_autocomplete)
+async def faab(inter: discord.Interaction, team: Optional[str] = None):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    rosters = await mfl.rosters()
+    players = await mfl.players()
+    inj = await mfl.get("injuries", max_age=1800, host=API_HOST)
+    injuries = {i["id"]: i.get("status", "")
+                for i in as_list((inj.get("injuries") or {}).get("injury"))}
+    adj = await mfl.get("salaryAdjustments", max_age=600)
+    adjustments = {}
+    for a in as_list((adj.get("salaryAdjustments") or {}).get("salaryAdjustment")):
+        adjustments[a["franchise_id"]] = adjustments.get(a["franchise_id"], 0.0) + money(a.get("amount"))
+    max_active = int(league.get("rosterSize") or 0)
+    ir_pct = money(league.get("includeIRWithSalary") or 100) / 100
+    foot = (f"Cap used = active salaries + {ir_pct:.0%} of taxi/IR + dead money (matches MFL). "
+            f"Activating from IR raises a player's cap hit from {ir_pct:.0%} to 100%. "
+            "Required = no longer IR-eligible (rule book §4b–c).")
+
+    if team:
+        fid = find_team(team, teams)
+        if not fid:
+            await inter.followup.send(f"Couldn't find a team matching **{team}**.")
+            return
+        fr = next((f for f in rosters if f["id"] == fid), {"id": fid})
+        n = faab_numbers(fr, league, adjustments, players, injuries)
+        e = discord.Embed(title=f"💵 FAAB — {teams.get(fid, fid)}", color=GOLD, url=LEAGUE_URL)
+        e.add_field(name="Room now", value=f"**{room_text(n['room'])}**", inline=True)
+        e.add_field(name="After required IR moves", value=room_text(n["room_must"]), inline=True)
+        e.add_field(name="If all IR activated", value=room_text(n["room_all"]), inline=True)
+        e.add_field(name="Cap", value=f"${n['pay']:,.2f} used of ${n['cap']:,.2f}"
+                    + (f" (incl. ${adjustments[fid]:,.2f} dead money)" if adjustments.get(fid) else ""),
+                    inline=False)
+        if n["ir"]:
+            lines = []
+            for x in sorted(n["ir"], key=lambda x: -money(x.get("salary"))):
+                p = players.get(x["id"])
+                nm = f"{p['name']} ({tag(p) or '?'})" if p else f"Player #{x['id']}"
+                sal = money(x.get("salary"))
+                why = " — ⚠️ must activate or cut" if x["id"] in n["must"] else \
+                      (f" — {injuries[x['id']]}" if injuries.get(x["id"]) else "")
+                lines.append(f"• {nm}: ${sal:,.2f} (+${sal * (1 - ir_pct):,.2f} if activated){why}")
+            e.add_field(name=f"On IR ({len(n['ir'])})", value="\n".join(lines)[:1024], inline=False)
+            after = n["active"] + len(n["ir"])
+            e.add_field(name="Roster", value=f"{n['active']}/{max_active} active now; "
+                        f"{after}/{max_active} if all IR activated"
+                        + (f" (would need to cut {after - max_active})" if max_active and after > max_active else ""),
+                        inline=False)
+        else:
+            e.add_field(name="On IR", value="Nobody on IR.", inline=False)
+        e.set_footer(text=foot)
+        await inter.followup.send(embed=e)
+        return
+
+    rows = [(faab_numbers(fr, league, adjustments, players, injuries), fr["id"]) for fr in rosters]
+    rows.sort(key=lambda r: -r[0]["room"])
+    lines = []
+    for i, (n, fid) in enumerate(rows, 1):
+        line = f"{i}. **{teams.get(fid, fid)}** — now **{room_text(n['room'])}**"
+        if n["ir"]:
+            if n["must"]:
+                line += f" · after required IR moves {room_text(n['room_must'])}"
+            line += f" · all IR activated {room_text(n['room_all'])} ({len(n['ir'])} on IR)"
+        lines.append(line)
+    await send_chunked(inter, f"💵 FAAB / Cap Room — {YEAR}", lines, footer=foot)
 
 
 # ---- /capnextyear ------------------------------------------------------------
