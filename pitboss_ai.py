@@ -59,6 +59,10 @@ RECENT_CONTEXT_MESSAGES = 12        # recent channel messages read when it is no
 RECENT_CONTEXT_MINUTES = 30         # ...only if they are this recent
 MAX_MEMORIES_IN_PROMPT = 150
 TRAINER_ROLE = "Pit Boss Trainer"
+SALARY_ESCALATION = 0.20            # league rollover: player salaries grow 20% a year (rule book 9k)
+CAP_ESCALATION = 0.05               # league rollover: the salary cap grows 5% every April 1 (rule 8d)
+# Rule 4h: every player must come off IR by April 1, so next season IR salaries count 100%.
+# Rule 11e: taxi (DTS) players count 25%. Rule 9k: franchise-tagged salaries follow the tag formula.
 # Channels where AI chat works. Empty = everywhere. Example: [123456789012345678]
 # (Discord: Settings > Advanced > Developer Mode ON, then right-click channel > Copy Channel ID)
 ALLOWED_CHANNEL_IDS = [1571013122410418256]
@@ -199,13 +203,17 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "team": {"type": "string", "description": "Team name or part of it"},
          "min_years_remaining": {"type": "integer",
-                                 "description": "Only count players with at least this many contract "
-                                                "years remaining (e.g. 2 to drop 0-1 year deals)"},
+                                 "description": "Only count players with at least this many years "
+                                                "remaining IN THE SEASON BEING ANALYZED (after rollover "
+                                                "when next_season is true)"},
          "next_season": {"type": "boolean",
-                         "description": "True = projecting next season (current dead money left out)"},
+                         "description": "True for ANY next-season question: applies the league "
+                                        "rollover (salaries +20% per rule 9k, cap +5%, years remaining -1, expiring "
+                                        "contracts drop off). False = this season, current data."},
          "ir_percent": {"type": "number",
-                        "description": "What-if: % of IR salaries that count (league rule is 25; "
-                                       "100 = full salary, e.g. assuming IR players return)"},
+                        "description": "Only for a what-if the user asks for: % of IR salaries that "
+                                       "count. Leave it out normally: this season uses 25% (rule 4g) "
+                                       "and next season uses 100% automatically (rule 4h)."},
          "taxi_percent": {"type": "number",
                           "description": "What-if: % of taxi salaries that count (league rule is 25; "
                                          "100 = full salary, e.g. assuming taxi players are promoted)"}},
@@ -559,8 +567,11 @@ class Brain:
                          f"{scores.get(e['id'], '0')} pts")
         return "\n".join(lines)
 
-    async def team_salary(self, team, min_years_remaining=0, next_season=False,
+    async def team_salary(self, team, min_years_remaining=None, next_season=False,
                           ir_percent=None, taxi_percent=None):
+        """Cap math in code. This season = MFL data as-is. Next season = league rollover:
+        every salary grows SALARY_ESCALATION (20%, rule 9k) and every years-remaining drops by 1;
+        contracts that hit 0 have expired and come off the books."""
         fid, teams = await self._team_id(team)
         if not fid:
             return f"No team matches '{team}'. Teams: " + ", ".join(teams.values())
@@ -574,17 +585,33 @@ class Brain:
             rule_note = (f" WHAT-IF (league rule: taxi {taxi_pct:.0%}, IR {ir_pct:.0%})")
         if ir_percent is not None:
             ir_pct = max(0.0, min(float(ir_percent), 100.0)) / 100
+        elif next_season:
+            ir_pct = 1.0   # rule 4h: everyone is off IR by April 1 (activated or waived)
         if taxi_percent is not None:
             taxi_pct = max(0.0, min(float(taxi_percent), 100.0)) / 100
+        grow = (1 + SALARY_ESCALATION) if next_season else 1.0
+        if next_season:
+            cap = round(cap * (1 + CAP_ESCALATION), 2)   # next season's cap
+        shift = 1 if next_season else 0
+        # Next season: anyone with 0 years left after rollover is gone, so 1+ is the floor.
+        floor = max(min_years_remaining or 0, 1 if next_season else 0)
         players = await self.mfl.players()
         fr = next((f for f in await self.mfl.rosters() if f["id"] == fid), {})
-        keep, drop = [], []
+        keep, drop, expired, tagged = [], [], [], []
         for e in self.as_list(fr.get("player")):
-            yrs_txt = str(e.get("contractInfo", "")).strip()   # years REMAINING
-            yrs = int(yrs_txt) if yrs_txt.lstrip("-").isdigit() else None
+            yrs_txt = str(e.get("contractInfo", "")).strip()   # years REMAINING (this season)
+            yrs = int(yrs_txt) - shift if yrs_txt.lstrip("-").isdigit() else None
             p = players.get(e["id"], {"name": f"Player #{e['id']}", "pos": "?", "team": ""})
-            row = (p["name"], p["pos"], e.get("status", "ROSTER"), money(e.get("salary")), yrs)
-            (keep if yrs is not None and yrs >= (min_years_remaining or 0) else drop).append(row)
+            row = (p["name"], p["pos"], e.get("status", "ROSTER"),
+                   round(money(e.get("salary")) * grow, 2), yrs)
+            if next_season and "tag" in str(e.get("contractStatus", "")).lower() and yrs and yrs >= 1:
+                tagged.append(f"{p['name']} ({e.get('contractStatus', '').strip()})")
+            if next_season and yrs is not None and yrs < 1:
+                expired.append(row)
+            elif yrs is not None and yrs >= floor:
+                keep.append(row)
+            else:
+                drop.append(row)
         full = sum(r[3] for r in keep)
         counted = sum(r[3] * (taxi_pct if r[2] == "TAXI_SQUAD" else
                               ir_pct if r[2] == "INJURED_RESERVE" else 1.0) for r in keep)
@@ -599,15 +626,30 @@ class Brain:
                 pass
         total = counted + dead
         keep.sort(key=lambda r: -r[3])
-        lines = [f"{teams[fid]} - players with {min_years_remaining or 0}+ contract years remaining "
-                 f"(MFL years remaining): {len(keep)} players",
+        season = (f"NEXT SEASON ({int(self.bot['YEAR']) + 1}) after rollover: salaries +"
+                  f"{SALARY_ESCALATION:.0%}, cap +{CAP_ESCALATION:.0%}, years remaining -1" if next_season
+                  else f"THIS SEASON ({self.bot['YEAR']}), current MFL data")
+        lines = [season,
+                 f"{teams[fid]} - players with {floor}+ years remaining: {len(keep)} players",
                  f"Raw salary total: ${full:,.2f}",
                  f"Cap number (taxi counted at {taxi_pct:.0%}, IR at {ir_pct:.0%}){rule_note}"
                  + ("" if next_season else f" + dead money ${dead:,.2f}") + f": ${total:,.2f}",
                  f"Salary cap: ${cap:,.2f} -> cap room ${cap - total:,.2f}"
-                 + (" (next season's cap may differ; current dead money not included)" if next_season else ""),
-                 f"Excluded: {len(drop)} players (${sum(r[3] for r in drop):,.2f})",
-                 "Included (salary, years):"]
+                 + (f" (this season's cap +{CAP_ESCALATION:.0%}; next season's dead money not known)"
+                    if next_season else "")]
+        if next_season:
+            lines.append(f"Contracts expiring at rollover (off the books): {len(expired)} players "
+                         f"(would have been ${sum(r[3] for r in expired):,.2f})")
+        if next_season and ir_percent is None:
+            lines.append("IR players counted at 100%: rule 4h, all players come off IR by April 1. "
+                         "Taxi stays at 25% (rule 11e).")
+        if tagged:
+            lines.append("CHECK: franchise/transition-tagged contracts may not follow the 20% raise "
+                         "(rule 9k); their salary here is +20% as an estimate: " + "; ".join(tagged[:8]))
+        if drop:
+            lines.append(f"Excluded by the years filter: {len(drop)} players "
+                         f"(${sum(r[3] for r in drop):,.2f})")
+        lines.append("Included (salary" + (f" after +{SALARY_ESCALATION:.0%}" if next_season else "") + ", years left):")
         lines += [f"- {n} {pos} {'(' + st.replace('_', ' ').title() + ') ' if st != 'ROSTER' else ''}"
                   f"${sal:,.2f}, {y} yr left" for n, pos, st, sal, y in keep]
         return "\n".join(lines)
@@ -960,6 +1002,9 @@ HOUSE_RULES = """
 - Contracts: "years" means YEARS REMAINING (shown as "N yr left"); the original deal length is
   only background. Never call the original length "years left".
 - Money/cap questions: ALWAYS use team_salary and report its numbers. Never add up salaries yourself.
+  This season = current MFL data. Next season = next_season=true, which applies the league rollover:
+  every salary +20% (rule book 9k), the cap +5% (8d), IR at full salary (4h: all off IR by April 1),
+  and every years-remaining -1, so 1-year deals expire. Say which season you mean.
   For what-ifs ("count IR at full salary", "if my taxi guys get promoted") use ir_percent / taxi_percent.
 - Follow-ups like "same report", "do that for my team", "what about him" refer to the recent
   messages shown above the question: repeat that request with the new team/player, using the
