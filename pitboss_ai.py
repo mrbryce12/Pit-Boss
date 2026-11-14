@@ -2950,21 +2950,43 @@ def setup(client, tree, mfl, bot_globals):
         return reply or ("🎲 That one's too big for one hand. Narrow it down: one team, one "
                          "position, or one player.")
 
-    @client.event
-    async def on_member_join(member):
-        """Give every new member the starter role (NEW_MEMBER_ROLE)."""
-        if not NEW_MEMBER_ROLE or member.bot:
-            return
-        role = discord.utils.get(member.guild.roles, name=NEW_MEMBER_ROLE)
+    async def give_starter_role(member):
+        role = next((r for r in member.guild.roles
+                     if r.name.strip().lower() == NEW_MEMBER_ROLE.strip().lower()), None)
         if role is None:
-            print(f"Auto-role: no role named '{NEW_MEMBER_ROLE}' in {member.guild.name}")
+            print(f"Auto-role: no role named '{NEW_MEMBER_ROLE}' in {member.guild.name} "
+                  f"(roles: {', '.join(r.name for r in member.guild.roles[1:])})")
+            return
+        if role in member.roles:
             return
         try:
             await member.add_roles(role, reason="Pit Boss: new member starter role")
             print(f"Auto-role: gave {member} the '{role.name}' role")
         except discord.Forbidden:
-            print(f"Auto-role: can't give '{role.name}'. Give Pit Boss's role 'Manage Roles' and drag "
-                  f"it ABOVE '{role.name}' in Server Settings > Roles.")
+            me = member.guild.me
+            print(f"Auto-role: NOT ALLOWED to give '{role.name}'. Pit Boss's top role is "
+                  f"'{me.top_role.name}' (position {me.top_role.position}) vs '{role.name}' "
+                  f"(position {role.position}); Manage Roles = {me.guild_permissions.manage_roles}. "
+                  f"Fix: Server Settings > Roles, give Pit Boss's role Manage Roles and drag it ABOVE "
+                  f"'{role.name}'.")
+
+    @client.event
+    async def on_member_join(member):
+        """Give every new member the starter role (NEW_MEMBER_ROLE)."""
+        if not NEW_MEMBER_ROLE or member.bot:
+            return
+        print(f"Auto-role: {member} joined {member.guild.name}"
+              + (" (waiting for them to accept the server rules)" if getattr(member, "pending", False) else ""))
+        if getattr(member, "pending", False):
+            return          # servers with Rules Screening: assign once they accept (on_member_update)
+        await give_starter_role(member)
+
+    @client.event
+    async def on_member_update(before, after):
+        # Member just finished the server's Rules Screening -> now give the starter role.
+        if NEW_MEMBER_ROLE and not after.bot and getattr(before, "pending", False) \
+                and not getattr(after, "pending", False):
+            await give_starter_role(after)
 
     @client.event
     async def on_message(message):
