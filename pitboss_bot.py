@@ -217,8 +217,8 @@ async def roster(inter: discord.Interaction, team: str):
         extra = []
         if e.get("salary"):
             extra.append(f"${e['salary']}")
-        if e.get("contractYear"):
-            extra.append(f"{e['contractYear']} yr")
+        if e.get("contractInfo"):  # contractInfo = years REMAINING (contractYear = original length)
+            extra.append(f"{e['contractInfo']} yr left")
         if extra:
             line += " — " + ", ".join(extra)
         groups.setdefault(e.get("status", "ROSTER"), {}).setdefault(p["pos"], []).append(line)
@@ -261,8 +261,9 @@ async def player(inter: discord.Interaction, name: str):
         embed.add_field(name="Owner", value=teams.get(fid, fid) + status, inline=True)
         if entry.get("salary"):
             embed.add_field(name="Salary", value=f"${entry['salary']}", inline=True)
-        if entry.get("contractYear"):
-            embed.add_field(name="Contract", value=f"{entry['contractYear']} yr", inline=True)
+        if entry.get("contractInfo"):  # years REMAINING
+            orig = f" (of {entry['contractYear']})" if entry.get("contractYear") else ""
+            embed.add_field(name="Years left", value=f"{entry['contractInfo']}{orig}", inline=True)
     else:
         embed.add_field(name="Owner", value="🟢 Free Agent", inline=True)
     embed.add_field(name=f"{YEAR} Points", value=score or "0", inline=True)

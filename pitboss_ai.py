@@ -48,13 +48,15 @@ except ImportError:  # requirements not installed yet
 # ---- Settings you might want to change -------------------------------------
 FAST_MODEL = "claude-haiku-5-5"     # everyday questions
 SMART_MODEL = "claude-sonnet-5-5"   # trade questions
-MAX_OUTPUT_TOKENS = 2000            # hard ceiling per answer (includes thinking)
+MAX_OUTPUT_TOKENS = 4000            # hard ceiling per answer (includes thinking)
 MAX_TOOL_ROUNDS = 6                 # how many lookups it can chain per question
 DAILY_REQUEST_LIMIT = 300           # whole server, resets at midnight Central
 USER_COOLDOWN_SECONDS = 8           # per person, stops spam
 USER_DAILY_LIMIT = 5                # questions per person per day (0 = no limit)
 TRAINERS_UNLIMITED = True           # trainers skip the per-person limit
 REPLY_CHAIN_DEPTH = 8               # earlier messages read for context
+RECENT_CONTEXT_MESSAGES = 12        # recent channel messages read when it is not a reply
+RECENT_CONTEXT_MINUTES = 30         # ...only if they are this recent
 MAX_MEMORIES_IN_PROMPT = 150
 TRAINER_ROLE = "Pit Boss Trainer"
 # Channels where AI chat works. Empty = everywhere. Example: [123456789012345678]
@@ -103,6 +105,20 @@ def _read_text(path, fallback=""):
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return fallback
+
+
+# ---- Contracts -----------------------------------------------------------------
+# MFL roster fields in this league (verified): contractInfo = YEARS REMAINING,
+# contractYear = ORIGINAL contract length, contractStatus = notes (extended, tagged...).
+# Always use years remaining for analysis.
+def contract_text(e):
+    left, orig = e.get("contractInfo"), e.get("contractYear")
+    txt = f"{left} yr left" if left not in (None, "") else "yrs left unknown"
+    if orig not in (None, ""):
+        txt += f" (of {orig}-yr deal)"
+    if e.get("contractStatus"):
+        txt += f", {e['contractStatus'].strip()}"
+    return txt
 
 
 # ---- Memory ("learning") ----------------------------------------------------
@@ -174,6 +190,25 @@ TOOLS = [
                     "salary, contract years and season points.",
      "input_schema": {"type": "object", "properties": {
          "team": {"type": "string", "description": "Team name or part of it"}},
+         "required": ["team"]}},
+    {"name": "team_salary",
+     "description": "Exact salary-cap math for one team, computed in code (never add salaries "
+                    "yourself). Filters by contract YEARS REMAINING (MFL contractInfo), applies "
+                    "the league's taxi/IR cap percentage, compares to the salary cap, and lists "
+                    "players included/excluded. Use for any cap, payroll or 'next season' money question.",
+     "input_schema": {"type": "object", "properties": {
+         "team": {"type": "string", "description": "Team name or part of it"},
+         "min_years_remaining": {"type": "integer",
+                                 "description": "Only count players with at least this many contract "
+                                                "years remaining (e.g. 2 to drop 0-1 year deals)"},
+         "next_season": {"type": "boolean",
+                         "description": "True = projecting next season (current dead money left out)"},
+         "ir_percent": {"type": "number",
+                        "description": "What-if: % of IR salaries that count (league rule is 25; "
+                                       "100 = full salary, e.g. assuming IR players return)"},
+         "taxi_percent": {"type": "number",
+                          "description": "What-if: % of taxi salaries that count (league rule is 25; "
+                                         "100 = full salary, e.g. assuming taxi players are promoted)"}},
          "required": ["team"]}},
     {"name": "player_info",
      "description": "Look up a player: position, NFL team, age, who owns them in Blue Chip "
@@ -520,8 +555,61 @@ class Brain:
                                                 players.get(e["id"], {}).get("pos", ""))):
             p = players.get(e["id"], {"name": f"Player #{e['id']}", "pos": "?", "team": ""})
             lines.append(f"{p['name']} {p['pos']} {p['team']} | {e.get('status')} | "
-                         f"${e.get('salary', '?')} {e.get('contractYear', '?')}yr | "
+                         f"${e.get('salary', '?')} {contract_text(e)} | "
                          f"{scores.get(e['id'], '0')} pts")
+        return "\n".join(lines)
+
+    async def team_salary(self, team, min_years_remaining=0, next_season=False,
+                          ir_percent=None, taxi_percent=None):
+        fid, teams = await self._team_id(team)
+        if not fid:
+            return f"No team matches '{team}'. Teams: " + ", ".join(teams.values())
+        lg = (await self.mfl.get("league", max_age=86400))["league"]
+        money = lambda x: float(str(x or 0).replace("$", "").replace(",", "") or 0)
+        cap = money(lg.get("salaryCapAmount"))
+        taxi_pct = money(lg.get("includeTaxiWithSalary") or 100) / 100
+        ir_pct = money(lg.get("includeIRWithSalary") or 100) / 100
+        rule_note = ""
+        if ir_percent is not None or taxi_percent is not None:
+            rule_note = (f" WHAT-IF (league rule: taxi {taxi_pct:.0%}, IR {ir_pct:.0%})")
+        if ir_percent is not None:
+            ir_pct = max(0.0, min(float(ir_percent), 100.0)) / 100
+        if taxi_percent is not None:
+            taxi_pct = max(0.0, min(float(taxi_percent), 100.0)) / 100
+        players = await self.mfl.players()
+        fr = next((f for f in await self.mfl.rosters() if f["id"] == fid), {})
+        keep, drop = [], []
+        for e in self.as_list(fr.get("player")):
+            yrs_txt = str(e.get("contractInfo", "")).strip()   # years REMAINING
+            yrs = int(yrs_txt) if yrs_txt.lstrip("-").isdigit() else None
+            p = players.get(e["id"], {"name": f"Player #{e['id']}", "pos": "?", "team": ""})
+            row = (p["name"], p["pos"], e.get("status", "ROSTER"), money(e.get("salary")), yrs)
+            (keep if yrs is not None and yrs >= (min_years_remaining or 0) else drop).append(row)
+        full = sum(r[3] for r in keep)
+        counted = sum(r[3] * (taxi_pct if r[2] == "TAXI_SQUAD" else
+                              ir_pct if r[2] == "INJURED_RESERVE" else 1.0) for r in keep)
+        dead = 0.0
+        if not next_season:
+            try:
+                adj = await self.mfl.get("salaryAdjustments", max_age=600)
+                dead = sum(money(a.get("amount")) for a in self.as_list(
+                    (adj.get("salaryAdjustments") or {}).get("salaryAdjustment"))
+                    if a.get("franchise_id") == fid)
+            except Exception:
+                pass
+        total = counted + dead
+        keep.sort(key=lambda r: -r[3])
+        lines = [f"{teams[fid]} - players with {min_years_remaining or 0}+ contract years remaining "
+                 f"(MFL years remaining): {len(keep)} players",
+                 f"Raw salary total: ${full:,.2f}",
+                 f"Cap number (taxi counted at {taxi_pct:.0%}, IR at {ir_pct:.0%}){rule_note}"
+                 + ("" if next_season else f" + dead money ${dead:,.2f}") + f": ${total:,.2f}",
+                 f"Salary cap: ${cap:,.2f} -> cap room ${cap - total:,.2f}"
+                 + (" (next season's cap may differ; current dead money not included)" if next_season else ""),
+                 f"Excluded: {len(drop)} players (${sum(r[3] for r in drop):,.2f})",
+                 "Included (salary, years):"]
+        lines += [f"- {n} {pos} {'(' + st.replace('_', ' ').title() + ') ' if st != 'ROSTER' else ''}"
+                  f"${sal:,.2f}, {y} yr left" for n, pos, st, sal, y in keep]
         return "\n".join(lines)
 
     async def player_info(self, name):
@@ -553,7 +641,7 @@ class Brain:
             if pid in owners:
                 fid, e = owners[pid]
                 line += (f" | owned by {teams.get(fid, fid)} ({e.get('status')}) "
-                         f"${e.get('salary', '?')} {e.get('contractYear', '?')}yr")
+                         f"${e.get('salary', '?')} {contract_text(e)}")
             else:
                 line += " | FREE AGENT"
             if injuries.get(pid):
@@ -869,6 +957,15 @@ HOUSE_RULES = """
   PRACTICE SQUAD or a reserve list (IR/PUP/NFI), or who isn't listed at all, over a healthy
   active-roster player, even a backup like an RB3. Say which sources you used, and if one
   failed to load, say so.
+- Contracts: "years" means YEARS REMAINING (shown as "N yr left"); the original deal length is
+  only background. Never call the original length "years left".
+- Money/cap questions: ALWAYS use team_salary and report its numbers. Never add up salaries yourself.
+  For what-ifs ("count IR at full salary", "if my taxi guys get promoted") use ir_percent / taxi_percent.
+- Follow-ups like "same report", "do that for my team", "what about him" refer to the recent
+  messages shown above the question: repeat that request with the new team/player, using the
+  same tool and options (e.g. the same contract-year filter). Ask only if it is truly unclear.
+- Lists ranked by a number (scorers, salaries) must be sorted by that number.
+- Long lists: summarize (totals + the top 10 or so) instead of listing every player, unless asked.
 - Keep answers short for Discord: usually under 120 words, bullet lists welcome.
   Longer only if asked. Use Discord markdown. No tables.
 - Trash talk stays light and about fantasy football only. Never about anyone's real life,
@@ -937,6 +1034,24 @@ async def reply_chain(message, bot_user):
     return list(reversed(chain))
 
 
+async def recent_context(message, bot_user):
+    """Recent messages in the channel (oldest first), so follow-ups like
+    'run the same report for my team' make sense without using Reply."""
+    lines = []
+    cutoff = message.created_at.timestamp() - RECENT_CONTEXT_MINUTES * 60
+    try:
+        async for prev in message.channel.history(limit=RECENT_CONTEXT_MESSAGES, before=message):
+            if prev.created_at.timestamp() < cutoff:
+                break
+            who = "Pit Boss (you)" if prev.author.id == bot_user.id else prev.author.display_name
+            text = clean_text(prev, bot_user) or (prev.embeds[0].title if prev.embeds else "")
+            if text:
+                lines.append(f"{who}: {text[:1200]}")
+    except Exception:
+        pass
+    return list(reversed(lines))
+
+
 def split_for_discord(text, limit=1900):
     parts = []
     while len(text) > limit:
@@ -974,24 +1089,51 @@ def setup(client, tree, mfl, bot_globals):
             convo = ("Earlier in this thread:\n" + "\n".join(history) +
                      f"\n\nNow {ctx['author']} says: {text}")
         else:
-            convo = f"{ctx['author']} says: {text}"
+            recent = await recent_context(message, client.user)
+            convo = (("Recent messages in this channel (context only; may be unrelated):\n"
+                      + "\n".join(recent) + "\n\n") if recent else "") + \
+                    f"Now {ctx['author']} says: {text}"
         model = SMART_MODEL if TRADE_WORDS.search(text) else FAST_MODEL
         messages = [{"role": "user", "content": convo}]
         system = build_system(ctx)
-        for _ in range(MAX_TOOL_ROUNDS + 1):
-            resp = await ai.messages.create(model=model, max_tokens=MAX_OUTPUT_TOKENS,
-                                            system=system, tools=TOOLS, messages=messages)
-            record_usage(model, resp.usage)
-            if resp.stop_reason != "tool_use":
-                break
-            messages.append({"role": "assistant", "content": resp.content})
+        async def run_tools(resp):
             results = []
             for block in resp.content:
                 if block.type == "tool_use":
                     out = await brain.run(block.name, block.input or {}, ctx)
                     results.append({"type": "tool_result", "tool_use_id": block.id,
                                     "content": str(out)[:25000]})
-            messages.append({"role": "user", "content": results})
+            return results
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            resp = await ai.messages.create(model=model, max_tokens=MAX_OUTPUT_TOKENS,
+                                            system=system, tools=TOOLS, messages=messages)
+            record_usage(model, resp.usage)
+            if resp.stop_reason != "tool_use":
+                break
+            messages.append({"role": "assistant", "content": resp.content})
+            messages.append({"role": "user", "content": await run_tools(resp)})
+        else:
+            resp = None  # used up all lookups without a final answer
+
+        # Make sure he always finishes: if he ran out of lookups or got cut off mid-answer,
+        # ask once more for a final answer with no further lookups allowed.
+        if resp is None or resp.stop_reason in ("tool_use", "max_tokens"):
+            why = "max_tokens" if resp is not None and resp.stop_reason == "max_tokens" else "lookups"
+            print(f"AI: finishing answer after hitting {why}")
+            if resp is not None and resp.stop_reason == "max_tokens":
+                partial = "\n".join(b.text for b in resp.content if b.type == "text")
+                messages.append({"role": "assistant", "content": partial or "(thinking)"})
+            nudge = ("Give your final answer now using what you've found. Keep it short: "
+                     "totals and key points, not every detail.")
+            if messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list):
+                messages[-1]["content"].append({"type": "text", "text": nudge})  # after tool results
+            else:
+                messages.append({"role": "user", "content": nudge})
+            resp = await ai.messages.create(model=model, max_tokens=MAX_OUTPUT_TOKENS,
+                                            system=system, tools=TOOLS, messages=messages,
+                                            tool_choice={"type": "none"})
+            record_usage(model, resp.usage)
         reply = "\n".join(b.text for b in resp.content if b.type == "text").strip()
         return reply or "🎲 The dealer's stumped on that one. Try asking another way."
 

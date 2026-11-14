@@ -43,7 +43,7 @@ Base: `{HOST}/{YEAR}/export?TYPE=<type>&L=27743&JSON=1` – public for this leag
   - Pick codes: `FP_<franchise>_<year>_<round>` (future), `DP_<round0>_<pick0>` (current year, 0-based), `BB_<amount>` (blind-bid dollars).
 - `leagueStandings`: already sorted; fields `h2hwlt`, `pf`, `pa`, `pp` (potential points), `eff`, `strk`, `salary`.
 - `playerScores` (`W=YTD` or week number, `POSITION`, `COUNT`, `PLAYERS`): sorted desc; `isAvailable` = "1" for free agents.
-- `league` → `league.franchises.franchise[]` (id, name). `rosters` → `rosters.franchise[].player[]` (id, status ROSTER/TAXI_SQUAD/INJURED_RESERVE, salary, contractYear). `players` → names are `"Last, First"`.
+- `league` → `league.franchises.franchise[]` (id, name). `rosters` → `rosters.franchise[].player[]` (id, status ROSTER/TAXI_SQUAD/INJURED_RESERVE, salary, contractYear, contractInfo, contractStatus, drafted). **In this league `contractInfo` = YEARS REMAINING and `contractYear` = ORIGINAL contract length** (e.g. Diggs: contractYear 3, contractInfo 2). Always use `contractInfo` for analysis. `players` → names are `"Last, First"`.
 - A single result may come back as an object instead of a list – always normalize (`as_list`).
 - `nflSchedule` (`W=week`, blank = current week) must be fetched from `https://api.myfantasyleague.com` **without** `L=` (with `L=` it redirects to the league host, which refuses it). `matchup[]` → `kickoff` (Unix time), `team[]` (`id`, `isHome`). Used by `/topscorers` to map NFL teams to game windows (TNF, Sunday intl/early/late, SNF, MNF, other); it shows the top 5 per position in `SCORER_POS` (Team QB/K/P excluded).
 - Positions in this league: Team QB/K/P are `TMQB`/`TMPK`/`TMPN` (not QB/PK/PN). Some team names contain HTML `<font>` tags – `mfl.teams()` strips them.
