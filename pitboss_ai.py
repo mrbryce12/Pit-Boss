@@ -59,7 +59,7 @@ RECENT_CONTEXT_MESSAGES = 12        # recent channel messages read when it is no
 RECENT_CONTEXT_MINUTES = 30         # ...only if they are this recent
 MAX_MEMORIES_IN_PROMPT = 150
 TRAINER_ROLE = "Pit Boss Trainer"
-NEW_MEMBER_ROLE = "Unknown"          # given automatically to everyone who joins ("" = off)
+NEW_MEMBER_ROLE = "Entrant"          # given automatically to everyone who joins ("" = off)
 
 # Web search + page reading (Claude's built-in server tools), limited to these sites.
 WEB_ON = True
@@ -568,6 +568,19 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "year": {"type": "integer"}, "team": {"type": "string"}, "week": {"type": "integer"}},
          "required": ["year", "team", "week"]}},
+    {"name": "live_scoring",
+     "description": "LIVE game-day scores for every matchup this week (players playing / yet to play); with a "
+                    "team, each starter's live points and game status.",
+     "input_schema": {"type": "object", "properties": {"team": {"type": "string"}}}},
+    {"name": "auction_results",
+     "description": "Free-agent auction results for any season (2014+): biggest winning bids, by team or player, with totals.",
+     "input_schema": {"type": "object", "properties": {
+         "year": {"type": "integer"}, "team": {"type": "string"}, "player": {"type": "string"},
+         "count": {"type": "integer"}}}},
+    {"name": "free_agents",
+     "description": "Best available free agents at a position, ranked by this season's points, with salary and injury status.",
+     "input_schema": {"type": "object", "properties": {
+         "position": {"type": "string"}, "count": {"type": "integer"}}, "required": ["position"]}},
     {"name": "save_memory",
      "description": "Remember a lasting fact about the league or its people for future "
                     "conversations: nicknames, which Discord user owns which team, rivalries, "
@@ -2651,6 +2664,82 @@ class Brain:
             return "\n".join(out)
         return f"{teams_then.get(fid)} had no game in {y} week {w} (bye or eliminated)."
 
+    # -- More MFL: live scoring, auction results, free agents --
+    async def live_scoring(self, team=None):
+        d = await self.mfl.get("liveScoring", max_age=60)
+        teams = await self.mfl.teams()
+        players = await self.mfl.players()
+        ms = self.as_list((d.get("liveScoring") or {}).get("matchup"))
+        if not ms:
+            return "No live scoring right now."
+        fid = self.bot["find_team"](team, teams) if team else None
+        week = (d.get("liveScoring") or {}).get("week", "")
+        def state(p):
+            secs = int(p.get("gameSecondsRemaining") or 0)
+            return "final" if secs == 0 else "not started" if secs >= 3600 else f"playing ({secs // 60} min left)"
+        out = [f"LIVE scoring, week {week} (refreshes every minute):"]
+        for m in ms:
+            fr = self.as_list(m.get("franchise"))
+            if fid and fid not in [f.get("id") for f in fr]:
+                continue
+            parts = []
+            for f in fr:
+                parts.append(f"{teams.get(f.get('id'))} {float(f.get('score') or 0):.2f} "
+                             f"({f.get('playersCurrentlyPlaying', 0)} playing, {f.get('playersYetToPlay', 0)} yet to play)")
+            out.append("- " + " vs ".join(parts))
+            if fid:
+                for f in fr:
+                    starters = [p for p in self.as_list((f.get("players") or {}).get("player"))
+                                if p.get("status") == "starter"]
+                    starters.sort(key=lambda p: -float(p.get("score") or 0))
+                    out.append(f"  {teams.get(f.get('id'))} starters: " + "; ".join(
+                        f"{players.get(p['id'], {}).get('name', p['id'])} {float(p.get('score') or 0):.2f} [{state(p)}]"
+                        for p in starters))
+        return "\n".join(out)
+
+    async def auction_results(self, year=None, team=None, player=None, count=20):
+        y = int(year or self.bot["YEAR"])
+        d = await self._hist(y, "auctionResults")
+        teams = await self._teams_in(y)
+        _, players = await self._hist_names(y)
+        rows = []
+        for u in self.as_list((d.get("auctionResults") or {}).get("auctionUnit")):
+            for a in self.as_list(u.get("auction")):
+                nm, pos = players.get(a.get("player"), (f"Player #{a.get('player')}", "?"))[:2]
+                rows.append((float(a.get("winningBid") or 0), nm, self._pos_key(pos), a.get("franchise")))
+        if not rows:
+            return f"No free-agent auction results for {y}."
+        fid = self.bot["find_team"](team, teams) if team else None
+        if fid:
+            rows = [r for r in rows if r[3] == fid]
+        if player:
+            rows = [r for r in rows if player.lower() in r[1].lower()]
+        rows.sort(reverse=True)
+        n = max(1, min(int(count or 20), 60))
+        total = sum(r[0] for r in rows)
+        out = [f"{y} free-agent auction" + (f" - {teams.get(fid)}" if fid else "") +
+               f": {len(rows)} players won, ${total:,.0f} total. Highest bids:"]
+        out += [f"- {nm} ({pos}) ${bid:,.0f} - {teams.get(f, f)}" for bid, nm, pos, f in rows[:n]]
+        return "\n".join(out)
+
+    async def free_agents(self, position, count=15):
+        pos = self._pos_key(position)
+        d = await self.mfl.get("freeAgents", max_age=600, POSITION=pos)
+        fa = self.as_list(((d.get("freeAgents") or {}).get("leagueUnit") or {}).get("player"))
+        if not fa:
+            return f"No free agents found at {pos}."
+        players = await self.mfl.players()
+        pts = await self._season_points(int(self.bot["YEAR"]))
+        injuries = await self._injuries()
+        rows = sorted(fa, key=lambda p: -pts.get(p["id"], 0.0))
+        n = max(1, min(int(count or 15), 40))
+        out = [f"Best available {pos} free agents by {self.bot['YEAR']} points (salary = MFL default if signed):"]
+        for p in rows[:n]:
+            info = players.get(p["id"], {"name": f"Player #{p['id']}", "team": ""})
+            out.append(f"- {info['name']} ({info.get('team', '')}): {pts.get(p['id'], 0.0):.1f} pts, "
+                       f"${p.get('salary', '?')}" + (f", injury: {injuries[p['id']]}" if injuries.get(p['id']) else ""))
+        return "\n".join(out)
+
     async def run(self, name, args, ctx):
         if name == "save_memory":
             item = add_memory(args.get("fact", ""), ctx["author"], ctx["is_trainer"])
@@ -2706,6 +2795,8 @@ HOUSE_RULES = """
   conflict, follow the common book's "Conflicts Between Rules" topic. Cite which book and section.
 - Draft picks: future_picks (counts, rounds, who owns whose pick), projected_draft_order (next draft),
   history_draft (any completed draft, including this year's). Never say picks can't be looked up.
+- Game day: live_scoring for "who's winning", live matchups and starters' live points.
+  Free agents: free_agents (best available by position). Auctions: auction_results (any season).
 - Past rosters and lineups: history_roster (any season, any week) and history_lineup (any week, incl.
   playoffs). Never say past rosters are unavailable.
 - Multi-season questions (careers, 'since then', grading drafts) use draft_grade / player_career, which
@@ -2864,7 +2955,38 @@ def split_for_discord(text, limit=1900):
     return [p for p in parts if p.strip()]
 
 
+class _Tee:
+    """Copy everything printed in the black window into data/pitboss.log (for troubleshooting)."""
+    def __init__(self, stream, path):
+        self.stream, self.path = stream, path
+
+    def write(self, text):
+        try:
+            self.stream.write(text)
+        except Exception:
+            pass
+        try:
+            DATA_DIR.mkdir(exist_ok=True)
+            if self.path.exists() and self.path.stat().st_size > 2_000_000:
+                self.path.replace(self.path.with_suffix(".old.log"))
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(text if text == "\n" else text.replace("\n", "\n"))
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+
+
 def setup(client, tree, mfl, bot_globals):
+    import sys
+    if not isinstance(sys.stdout, _Tee):
+        sys.stdout = _Tee(sys.stdout, DATA_DIR / "pitboss.log")
+        sys.stderr = _Tee(sys.stderr, DATA_DIR / "pitboss.log")
+    print(f"\n===== Pit Boss starting {datetime.now():%Y-%m-%d %H:%M:%S} =====")
     key = os.environ.get("ANTHROPIC_API_KEY") or _read_text(HERE / "anthropic_key.txt").strip()
     if not key.startswith("sk-ant"):  # missing or still the placeholder text
         key = ""
@@ -2969,6 +3091,28 @@ def setup(client, tree, mfl, bot_globals):
                   f"(position {role.position}); Manage Roles = {me.guild_permissions.manage_roles}. "
                   f"Fix: Server Settings > Roles, give Pit Boss's role Manage Roles and drag it ABOVE "
                   f"'{role.name}'.")
+
+    @tree.command(name="checkautorole", description="Trainers: check why the new-member role is or isn't working")
+    async def checkautorole(inter: discord.Interaction):
+        if not await trainer_only(inter):
+            return
+        g = inter.guild
+        me = g.me
+        role = next((r for r in g.roles if r.name.strip().lower() == NEW_MEMBER_ROLE.strip().lower()), None)
+        lines = [f"Starter role setting: '{NEW_MEMBER_ROLE}'",
+                 f"Server Members Intent (join events): {'ON' if client.intents.members else 'OFF'}",
+                 f"Role exists: {'yes - ' + role.name + f' (position {role.position})' if role else 'NO'}",
+                 f"Pit Boss's top role: {me.top_role.name} (position {me.top_role.position})",
+                 f"Pit Boss has Manage Roles: {'yes' if me.guild_permissions.manage_roles else 'NO'}"]
+        if role:
+            ok_pos = me.top_role.position > role.position
+            lines.append(f"Pit Boss's role is above '{role.name}': {'yes' if ok_pos else 'NO - drag Pit Boss above it'}")
+            if role.managed:
+                lines.append("That role is managed by an integration and can't be assigned.")
+        problems = [l for l in lines if "NO" in l or "OFF" in l]
+        lines.append("All good - new members should get the role." if not problems else
+                     "Fix the NO/OFF items above, then have someone rejoin.")
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
 
     @client.event
     async def on_member_join(member):
