@@ -376,6 +376,50 @@ TOOLS = [
          "results": {"type": "array", "items": {"type": "object", "properties": {
              "week": {"type": "integer"}, "winner": {"type": "string"}}},
                      "description": "Specific hypothetical winners, e.g. [{week: 11, winner: 'Penn State'}]"}}}},
+    {"name": "scoring_stats",
+     "description": "Scoring calculator by position, computed in code from EVERY player's weekly score: "
+                    "player count, average total, points per game, median, leader, optional top-N average. "
+                    "Any week range (from_week/to_week), any season (year), all positions or some, and "
+                    "filters: rostered only, free agents only, or one fantasy team. Use for ANY average, "
+                    "total or comparison of scoring across players or positions.",
+     "input_schema": {"type": "object", "properties": {
+         "positions": {"type": "array", "items": {"type": "string"}, "description": "Omit for all positions"},
+         "from_week": {"type": "integer"}, "to_week": {"type": "integer"},
+         "rostered_only": {"type": "boolean"}, "free_agents_only": {"type": "boolean"},
+         "team": {"type": "string"}, "top_n": {"type": "integer"},
+         "year": {"type": "integer", "description": "Past season (2014+); omit for this season"}}}},
+    {"name": "team_rankings",
+     "description": "Power rankings for all teams, computed from weekly results: record, ALL-PLAY record, "
+                    "points for/against, avg per week, consistency (std dev), high/low score, and LUCK "
+                    "(wins vs all-play expected wins). Sort by all_play, points_for, points_against, luck or consistency.",
+     "input_schema": {"type": "object", "properties": {
+         "through_week": {"type": "integer"},
+         "sort_by": {"type": "string", "enum": ["all_play", "points_for", "points_against", "luck", "consistency"]}}}},
+    {"name": "weekly_records",
+     "description": "Single-game records for a season: highest and lowest scores, biggest blowouts, closest games.",
+     "input_schema": {"type": "object", "properties": {
+         "year": {"type": "integer"}, "through_week": {"type": "integer"}, "count": {"type": "integer"}}}},
+    {"name": "head_to_head",
+     "description": "Head-to-head record and every game between two teams, this season or across past seasons.",
+     "input_schema": {"type": "object", "properties": {
+         "team_a": {"type": "string"}, "team_b": {"type": "string"},
+         "years": {"type": "array", "items": {"type": "integer"}}}, "required": ["team_a", "team_b"]}},
+    {"name": "position_strength",
+     "description": "Points each team got from its STARTERS at every position this season, ranked league-wide "
+                    "(one team's ranks vs league average, or best/worst teams per position).",
+     "input_schema": {"type": "object", "properties": {
+         "team": {"type": "string"}, "through_week": {"type": "integer"}}}},
+    {"name": "trade_compare",
+     "description": "Side-by-side trade math: each player's salary now, next season (+20%), years left, total "
+                    "owed over the contract, season points, injury, contract notes; totals and differences. "
+                    "Draft picks are listed. Use with player_info/team_roster for the verdict.",
+     "input_schema": {"type": "object", "properties": {
+         "side_a": {"type": "array", "items": {"type": "string"}, "description": "Players/picks one team receives"},
+         "side_b": {"type": "array", "items": {"type": "string"}, "description": "Players/picks the other team receives"},
+         "team_a": {"type": "string"}, "team_b": {"type": "string"}}, "required": ["side_a", "side_b"]}},
+    {"name": "league_cap_table",
+     "description": "Every team's cap number and cap room, ranked, this season or next season (rollover rules).",
+     "input_schema": {"type": "object", "properties": {"next_season": {"type": "boolean"}}}},
     {"name": "save_memory",
      "description": "Remember a lasting fact about the league or its people for future "
                     "conversations: nicknames, which Discord user owns which team, rivalries, "
@@ -1589,6 +1633,370 @@ class Brain:
                 f"{teams.get(r['id'])} ({r['h2hwlt']}, {self.bot['games_back'](r, last):g} GB)" for r in bubble))
         return "\n".join(out)
 
+    # -- Scoring stats calculator: averages / totals by position, any week range --
+    async def _week_scores(self, week, year=None):
+        """{player id: points} for every player in one week (one MFL call)."""
+        if year and int(year) != int(self.bot["YEAR"]):
+            d = await self._hist(year, "playerScores", W=str(week), COUNT="5000")
+        else:
+            d = await self.mfl.get("playerScores", max_age=1800, W=str(week), COUNT="5000")
+        return {s["id"]: float(s.get("score") or 0)
+                for s in self.as_list((d.get("playerScores") or {}).get("playerScore"))}
+
+    async def scoring_stats(self, positions=None, from_week=1, to_week=None, rostered_only=False,
+                            free_agents_only=False, team=None, top_n=None, year=None):
+        cur_year = int(self.bot["YEAR"])
+        year = int(year or cur_year)
+        if year == cur_year:
+            players = {pid: (p["name"], p["pos"]) for pid, p in (await self.mfl.players()).items()}
+            owners = await self.mfl.owners()
+            teams = await self.mfl.teams()
+        else:
+            teams, hp = await self._hist_names(year)
+            players = {pid: (v[0], v[1]) for pid, v in hp.items()}
+            owners = {}
+            if rostered_only or free_agents_only or team:
+                d = await self._hist(year, "rosters")
+                for fr in self.as_list(d["rosters"]["franchise"]):
+                    for e in self.as_list(fr.get("player")):
+                        owners[e["id"]] = (fr["id"], e)
+        fid = None
+        if team:
+            fid = self.bot["find_team"](team, teams)
+            if not fid:
+                return f"No team matches '{team}'."
+        start = max(1, int(from_week or 1))
+        end = int(to_week or 18)
+        weeks, totals, games = [], {}, {}
+        for w in range(start, end + 1):
+            sc = await self._week_scores(w, year)
+            if not sc or not any(sc.values()):
+                if to_week:
+                    continue
+                break                       # reached weeks not played yet
+            weeks.append(w)
+            for pid, pts in sc.items():
+                totals[pid] = totals.get(pid, 0.0) + pts
+                if pts != 0:
+                    games[pid] = games.get(pid, 0) + 1
+        if not weeks:
+            return f"No scores found for {year} weeks {start}-{end}."
+        want = {self._pos_key(p) for p in positions} if positions else None
+        groups = {}
+        for pid, tot in totals.items():
+            name, pos = players.get(pid, (f"Player #{pid}", "?"))
+            pos = self._pos_key(pos)
+            if want and pos not in want:
+                continue
+            if not games.get(pid):
+                continue                    # never scored in the range
+            if rostered_only and pid not in owners:
+                continue
+            if free_agents_only and pid in owners:
+                continue
+            if fid and owners.get(pid, (None,))[0] != fid:
+                continue
+            groups.setdefault(pos, []).append((tot, games[pid], name))
+        scope = ("rostered players only" if rostered_only else "free agents only" if free_agents_only
+                 else f"{teams.get(fid)} roster" if fid else "all players who scored")
+        out = [f"Scoring by position, {year} weeks {weeks[0]}-{weeks[-1]} ({len(weeks)} weeks), {scope}. "
+               f"Computed in code from every player's weekly score."]
+        rows = []
+        for pos, lst in groups.items():
+            lst.sort(reverse=True)
+            n = len(lst)
+            tot = [x[0] for x in lst]
+            ppg = sum(x[0] for x in lst) / max(1, sum(x[1] for x in lst))
+            med = tot[n // 2] if n % 2 else (tot[n // 2 - 1] + tot[n // 2]) / 2
+            row = (sum(tot) / n, pos, n, ppg, med, lst[0])
+            if top_n:
+                k = min(int(top_n), n)
+                row += (sum(tot[:k]) / k, k)
+            rows.append(row)
+        rows.sort(reverse=True)
+        for r in rows:
+            avg, pos, n, ppg, med, lead = r[:6]
+            line = (f"- {pos}: {n} players, avg {avg:.1f} pts total, {ppg:.1f} per game played, "
+                    f"median {med:.1f}; leader {lead[2]} {lead[0]:.1f}")
+            if top_n:
+                line += f"; top-{r[7]} avg {r[6]:.1f}"
+            out.append(line)
+        out.append("TMQB/TMPK/TMPN are NFL team units (this league has no individual QBs/kickers/punters).")
+        return "\n".join(out)
+
+    # -- Sweep: team comparisons, luck, records, H2H, positional strength, trades, league cap --
+    async def _weekly(self, week, year=None):
+        if year and int(year) != int(self.bot["YEAR"]):
+            d = await self._hist(year, "weeklyResults", W=str(week))
+        else:
+            d = await self.mfl.get("weeklyResults", max_age=1800, W=str(week))
+        games = []
+        for m in self.as_list((d.get("weeklyResults") or {}).get("matchup")):
+            fr = self.as_list(m.get("franchise"))
+            if len(fr) == 2 and (float(fr[0].get("score") or 0) or float(fr[1].get("score") or 0)):
+                games.append(fr)
+        return games
+
+    async def _season_games(self, through_week=None, year=None):
+        """[(week, [franchise a, franchise b])] for played regular-season games."""
+        out = []
+        last = 13
+        if not year or int(year) == int(self.bot["YEAR"]):
+            lg = (await self.mfl.get("league", max_age=86400))["league"]
+            last = int(lg.get("lastRegularSeasonWeek") or 13)
+        for w in range(1, min(int(through_week or last), last) + 1):
+            games = await self._weekly(w, year)
+            if not games:
+                if through_week:
+                    continue
+                break
+            out += [(w, g) for g in games]
+        return out
+
+    async def team_rankings(self, through_week=None, sort_by="all_play"):
+        import statistics
+        teams = await self.mfl.teams()
+        games = await self._season_games(through_week)
+        if not games:
+            return "No completed games yet."
+        st = {fid: {"w": 0, "l": 0, "t": 0, "pf": 0.0, "pa": 0.0, "scores": [], "apw": 0, "apl": 0}
+              for fid in teams}
+        by_week = {}
+        for w, (a, b) in games:
+            sa, sb = float(a.get("score") or 0), float(b.get("score") or 0)
+            for me, op, s1, s2 in ((a, b, sa, sb), (b, a, sb, sa)):
+                r = st.setdefault(me["id"], {"w": 0, "l": 0, "t": 0, "pf": 0.0, "pa": 0.0,
+                                             "scores": [], "apw": 0, "apl": 0})
+                r["pf"] += s1
+                r["pa"] += s2
+                r["scores"].append(s1)
+                r["w" if s1 > s2 else "l" if s1 < s2 else "t"] += 1
+                by_week.setdefault(w, []).append((me["id"], s1))
+        for w, lst in by_week.items():          # all-play: you vs every other team that week
+            for fid, s in lst:
+                st[fid]["apw"] += sum(1 for o, so in lst if o != fid and s > so)
+                st[fid]["apl"] += sum(1 for o, so in lst if o != fid and s < so)
+        rows = []
+        for fid, r in st.items():
+            g = len(r["scores"])
+            if not g:
+                continue
+            ap_pct = r["apw"] / max(1, r["apw"] + r["apl"])
+            exp_w = ap_pct * g
+            rows.append({"fid": fid, "rec": f"{r['w']}-{r['l']}" + (f"-{r['t']}" if r['t'] else ""),
+                         "w": r["w"], "pf": r["pf"], "pa": r["pa"], "avg": r["pf"] / g,
+                         "sd": statistics.pstdev(r["scores"]) if g > 1 else 0.0,
+                         "hi": max(r["scores"]), "lo": min(r["scores"]),
+                         "ap": f"{r['apw']}-{r['apl']}", "ap_pct": ap_pct, "luck": r["w"] - exp_w})
+        key = {"all_play": lambda x: -x["ap_pct"], "points_for": lambda x: -x["pf"],
+               "points_against": lambda x: -x["pa"], "luck": lambda x: -x["luck"],
+               "consistency": lambda x: x["sd"]}.get(sort_by or "all_play", lambda x: -x["ap_pct"])
+        rows.sort(key=key)
+        wk = max(w for w, _ in games)
+        out = [f"Team rankings through week {wk}, sorted by {sort_by or 'all_play'}. All-play = record if you "
+               f"played every team every week. Luck = actual wins minus all-play expected wins."]
+        for i, x in enumerate(rows, 1):
+            out.append(f"{i}. {teams.get(x['fid'])}: {x['rec']} | all-play {x['ap']} | PF {x['pf']:.1f} "
+                       f"({x['avg']:.1f}/wk, sd {x['sd']:.1f}, high {x['hi']:.1f}, low {x['lo']:.1f}) | "
+                       f"PA {x['pa']:.1f} | luck {x['luck']:+.1f} wins")
+        return "\n".join(out)
+
+    async def weekly_records(self, through_week=None, year=None, count=5):
+        teams = (await self._hist_names(year))[0] if year and int(year) != int(self.bot["YEAR"]) \
+            else await self.mfl.teams()
+        games = await self._season_games(through_week, year)
+        if not games:
+            return "No completed games."
+        n = max(1, min(int(count or 5), 15))
+        scores, margins = [], []
+        for w, (a, b) in games:
+            sa, sb = float(a.get("score") or 0), float(b.get("score") or 0)
+            scores += [(sa, w, a["id"], b["id"]), (sb, w, b["id"], a["id"])]
+            win, lose, ws, ls = (a, b, sa, sb) if sa >= sb else (b, a, sb, sa)
+            margins.append((ws - ls, w, win["id"], lose["id"], ws, ls))
+        T = lambda f: teams.get(f, f)
+        hi = sorted(scores, reverse=True)[:n]
+        lo = sorted(scores)[:n]
+        blow = sorted(margins, reverse=True)[:n]
+        close = sorted(margins)[:n]
+        yr = year or self.bot["YEAR"]
+        out = [f"{yr} single-game records (regular season):", "Highest scores:"]
+        out += [f"- {T(f)} {s:.2f} vs {T(o)} (wk {w})" for s, w, f, o in hi]
+        out.append("Lowest scores:")
+        out += [f"- {T(f)} {s:.2f} vs {T(o)} (wk {w})" for s, w, f, o in lo]
+        out.append("Biggest blowouts:")
+        out += [f"- {T(f)} beat {T(o)} by {m:.2f} ({ws:.2f}-{ls:.2f}, wk {w})" for m, w, f, o, ws, ls in blow]
+        out.append("Closest games:")
+        out += [f"- {T(f)} edged {T(o)} by {m:.2f} ({ws:.2f}-{ls:.2f}, wk {w})" for m, w, f, o, ws, ls in close]
+        return "\n".join(out)
+
+    async def head_to_head(self, team_a, team_b, years=None):
+        teams = await self.mfl.teams()
+        fa, fb = self.bot["find_team"](team_a, teams), self.bot["find_team"](team_b, teams)
+        if not fa or not fb:
+            return f"Couldn't match both teams ('{team_a}', '{team_b}')."
+        cur = int(self.bot["YEAR"])
+        yrs = sorted({int(y) for y in (years or [cur])})
+        rec = {fa: 0, fb: 0, "t": 0}
+        lines = []
+        for y in yrs:
+            for w, (a, b) in await self._season_games(None, y):
+                ids = {a["id"], b["id"]}
+                if ids != {fa, fb}:
+                    continue
+                sa, sb = float(a.get("score") or 0), float(b.get("score") or 0)
+                s = {a["id"]: sa, b["id"]: sb}
+                win = fa if s[fa] > s[fb] else fb if s[fb] > s[fa] else "t"
+                rec[win] += 1
+                lines.append(f"- {y} wk {w}: {teams[fa]} {s[fa]:.2f} - {s[fb]:.2f} {teams[fb]}")
+        head = (f"Head to head ({', '.join(map(str, yrs))}; franchise slots, current team names): "
+                f"{teams[fa]} {rec[fa]} - {rec[fb]} {teams[fb]}" + (f" - {rec['t']} ties" if rec['t'] else ""))
+        return head + "\n" + ("\n".join(lines) or "They haven't played in those seasons.")
+
+    async def position_strength(self, team=None, through_week=None):
+        teams = await self.mfl.teams()
+        players = await self.mfl.players()
+        fid = None
+        if team:
+            fid = self.bot["find_team"](team, teams)
+            if not fid:
+                return f"No team matches '{team}'."
+        lg = (await self.mfl.get("league", max_age=86400))["league"]
+        last = int(lg.get("lastRegularSeasonWeek") or 13)
+        pts, weeks = {}, 0
+        for w in range(1, min(int(through_week or last), last) + 1):
+            d = await self.mfl.get("weeklyResults", max_age=1800, W=str(w))
+            ms = self.as_list((d.get("weeklyResults") or {}).get("matchup"))
+            played = False
+            for m in ms:
+                for fr in self.as_list(m.get("franchise")):
+                    if float(fr.get("score") or 0):
+                        played = True
+                    for p in self.as_list(fr.get("player")):
+                        if p.get("status") != "starter":
+                            continue
+                        sc = float(p.get("score") or 0)
+                        pos = self._pos_key(players.get(p["id"], {}).get("pos", "?"))
+                        pts.setdefault(pos, {}).setdefault(fr["id"], 0.0)
+                        pts[pos][fr["id"]] += sc
+            if not played:
+                break
+            weeks = w
+        if not weeks:
+            return "No completed weeks yet."
+        out = [f"Starting-lineup points by position, weeks 1-{weeks} (what each team actually started):"]
+        for pos in sorted(pts):
+            ranked = sorted(pts[pos].items(), key=lambda x: -x[1])
+            if fid:
+                rank = next((i for i, (f, _) in enumerate(ranked, 1) if f == fid), None)
+                val = pts[pos].get(fid, 0.0)
+                avg = sum(v for _, v in ranked) / len(ranked)
+                out.append(f"- {pos}: {val:.1f} pts, " + (f"#{rank} of {len(ranked)}" if rank else "no starters used")
+                           + f" (league avg {avg:.1f})")
+            else:
+                top = ", ".join(f"{teams.get(f)} {v:.1f}" for f, v in ranked[:3])
+                bot = ", ".join(f"{teams.get(f)} {v:.1f}" for f, v in ranked[-2:])
+                out.append(f"- {pos}: best {top} | worst {bot}")
+        if fid:
+            out[0] = out[0].replace("Starting-lineup", f"{teams[fid]} starting-lineup")
+        return "\n".join(out)
+
+    async def trade_compare(self, side_a, side_b, team_a=None, team_b=None):
+        rows = {r["id"]: r for r in await self._league_salaries()}
+        players = await self.mfl.players()
+        teams = await self.mfl.teams()
+        injuries = await self._injuries()
+        sides = []
+        for label, items in (("Side A" + (f" ({team_a} receives)" if team_a else ""), side_a),
+                             ("Side B" + (f" ({team_b} receives)" if team_b else ""), side_b)):
+            ids, picks = [], []
+            for it in items or []:
+                words = str(it).lower().split()
+                if re.search(r"\b(pick|round|rd|1st|2nd|3rd|\d\.\d\d)\b", str(it).lower()):
+                    picks.append(str(it))
+                    continue
+                hit = next((pid for pid, p in players.items()
+                            if all(w in p["name"].lower() for w in words) and pid in rows), None) or \
+                    next((pid for pid, p in players.items() if all(w in p["name"].lower() for w in words)), None)
+                if hit:
+                    ids.append(hit)
+                else:
+                    picks.append(f"{it} (not matched)")
+            sides.append((label, ids, picks))
+        all_ids = [i for _, ids, _ in sides for i in ids]
+        season = await self._scores(all_ids)
+        out = ["Trade comparison (computed). Next season = +20% salary, years -1 (rule 9k); "
+               "total owed = every remaining year with 20% raises."]
+        summary = []
+        for label, ids, picks in sides:
+            out.append(f"\n{label}:")
+            t_now = t_next = t_owed = t_pts = 0.0
+            for pid in ids:
+                r = rows.get(pid)
+                p = players[pid]
+                pts = float(season.get(pid) or 0)
+                t_pts += pts
+                if r:
+                    left = int(r["left"]) if str(r["left"]).isdigit() else 0
+                    owed = sum(r["salary"] * (1.2 ** k) for k in range(max(left, 0)))
+                    nxt = r["salary"] * 1.2 if left >= 2 else 0.0
+                    t_now += r["salary"]
+                    t_next += nxt
+                    t_owed += owed
+                    out.append(f"- {p['name']} {p['pos']} {p['team']}: ${r['salary']:,.2f}, {left} yr left, "
+                               f"next season ${nxt:,.2f}{' (expires)' if left < 2 else ''}, total owed ${owed:,.2f}, "
+                               f"{pts:.1f} pts this season"
+                               + (f", injury: {injuries[pid]}" if injuries.get(pid) else "")
+                               + (f", {r['note']}" if r['note'] else ""))
+                else:
+                    out.append(f"- {p['name']} {p['pos']} {p['team']}: free agent, {pts:.1f} pts")
+            for pk in picks:
+                out.append(f"- {pk} (draft pick: no salary; value is your call)")
+            summary.append((label, t_now, t_next, t_owed, t_pts))
+            out.append(f"  Totals: salary now ${t_now:,.2f} | next season ${t_next:,.2f} | "
+                       f"total owed ${t_owed:,.2f} | {t_pts:.1f} pts this season")
+        if len(summary) == 2:
+            (la, a1, a2, a3, a4), (lb, b1, b2, b3, b4) = summary
+            out.append(f"\nDifference (A minus B): salary now ${a1 - b1:+,.2f} | next season ${a2 - b2:+,.2f} | "
+                       f"total owed ${a3 - b3:+,.2f} | points {a4 - b4:+.1f}")
+        return "\n".join(out)
+
+    async def league_cap_table(self, next_season=False):
+        teams = await self.mfl.teams()
+        lg = (await self.mfl.get("league", max_age=86400))["league"]
+        money = lambda x: float(str(x or 0).replace("$", "").replace(",", "") or 0)
+        cap = money(lg.get("salaryCapAmount"))
+        taxi = money(lg.get("includeTaxiWithSalary") or 100) / 100
+        ir = money(lg.get("includeIRWithSalary") or 100) / 100
+        dead = {}
+        if not next_season:
+            try:
+                adj = await self.mfl.get("salaryAdjustments", max_age=600)
+                for a in self.as_list((adj.get("salaryAdjustments") or {}).get("salaryAdjustment")):
+                    dead[a.get("franchise_id")] = dead.get(a.get("franchise_id"), 0.0) + money(a.get("amount"))
+            except Exception:
+                pass
+        if next_season:
+            cap = round(cap * (1 + CAP_ESCALATION), 2)
+            ir = 1.0
+        tot = {fid: dead.get(fid, 0.0) for fid in teams}
+        for r in await self._league_salaries():
+            left = int(r["left"]) if str(r["left"]).isdigit() else 0
+            sal = r["salary"]
+            if next_season:
+                if left - 1 < 1:
+                    continue
+                sal *= (1 + SALARY_ESCALATION)
+            pct = taxi if r["status"] == "TAXI_SQUAD" else ir if r["status"] == "INJURED_RESERVE" else 1.0
+            tot[r["fid"]] = tot.get(r["fid"], 0.0) + sal * pct
+        rows = sorted(tot.items(), key=lambda x: x[1])
+        label = (f"NEXT SEASON ({int(self.bot['YEAR']) + 1}) after rollover: salaries +20%, cap +5% "
+                 f"(${cap:,.2f}), years -1, IR at 100%, taxi 25%" if next_season
+                 else f"THIS SEASON: cap ${cap:,.2f}, taxi/IR at {taxi:.0%}/{ir:.0%}, dead money included")
+        out = [f"League cap table, most room first. {label}:"]
+        out += [f"{i}. {teams.get(f)}: ${v:,.2f} -> room ${cap - v:,.2f}" for i, (f, v) in enumerate(rows, 1)]
+        return "\n".join(out)
+
     async def run(self, name, args, ctx):
         if name == "save_memory":
             item = add_memory(args.get("fact", ""), ctx["author"], ctx["is_trainer"])
@@ -1624,6 +2032,12 @@ HOUSE_RULES = """
   failed to load, say so.
 - Contracts: "years" means YEARS REMAINING (shown as "N yr left"); the original deal length is
   only background. Never call the original length "years left".
+- MATH: never add, average, rank or count numbers yourself, and never offer 'rough' hand math.
+  Every number comes from a tool that computed it (scoring_stats, team_salary, tag/holdout tools,
+  what_if_playoffs...). Never tell users about 'lookups', API limits or tool caps; just get the answer.
+  This league has no individual QBs/kickers/punters: QB, PK and PN are NFL team units (TMQB/TMPK/TMPN).
+- League-wide comparisons: team_rankings (power/luck/consistency/PA), weekly_records, head_to_head,
+  position_strength, league_cap_table, trade_compare (trade math). One call, then talk.
 - What-ifs are your job, not a reason to refuse. 'If the season ended week N', 'what if X wins out',
   'what if X beats Y': use what_if_playoffs (standings/bracket), team_salary options (cap), holdout_report
   through_week, or history tools. Label the answer as a what-if. Only refuse if no tool can model it,
