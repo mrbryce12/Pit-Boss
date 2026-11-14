@@ -587,6 +587,39 @@ TOOLS = [
      "description": "Exact arithmetic on numbers you already have (from tools or the user): + - * / ** ( ) "
                     "round, min, max, sum, abs. e.g. '2395.31 / 2663.46 * 100'. Use instead of mental math.",
      "input_schema": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}},
+    {"name": "points_allowed",
+     "description": "How many fantasy points (Blue Chip scoring) each NFL defense has allowed to a "
+                    "position this season, ranked toughest to softest matchup. Give position (QB, RB, WR, "
+                    "TE, PK, DL, LB, CB, S...) for a league-wide ranking, and/or an NFL team (e.g. KCC, DAL) "
+                    "to see what that defense allows at every position with its rank.",
+     "input_schema": {"type": "object", "properties": {
+         "position": {"type": "string"}, "nfl_team": {"type": "string"}}}},
+    {"name": "bye_weeks",
+     "description": "NFL bye weeks for the season. With week: which NFL teams are on bye and, if a "
+                    "Blue Chip team is given, which of its rostered players are on bye. With nfl_team: "
+                    "that team's bye week. With nothing: the full bye schedule.",
+     "input_schema": {"type": "object", "properties": {
+         "week": {"type": "integer"}, "nfl_team": {"type": "string"},
+         "team": {"type": "string", "description": "Blue Chip franchise name, owner, or id"}}}},
+    {"name": "trending_players",
+     "description": "MFL-wide trends across all MyFantasyLeague leagues (not just Blue Chip): most "
+                    "added, most dropped, or most owned players this week, with % of leagues, and "
+                    "who owns each player in Blue Chip (or free agent). kind = adds | drops | owned.",
+     "input_schema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["adds", "drops", "owned"]},
+         "position": {"type": "string"}, "count": {"type": "integer"},
+         "free_agents_only": {"type": "boolean", "description": "only players unowned in Blue Chip"}},
+         "required": ["kind"]}},
+    {"name": "market_values",
+     "description": "MFL-wide draft market: ADP (average draft pick) or AAV (average auction value, "
+                    "MFL-normalized units, compare players relative to each other) across MyFantasyLeague leagues this season. Look up players by "
+                    "name or rank a position. kind = adp | aav. keeper=true limits to keeper/dynasty "
+                    "leagues when MFL has that data. Context only - not Blue Chip salaries.",
+     "input_schema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["adp", "aav"]},
+         "players": {"type": "array", "items": {"type": "string"}},
+         "position": {"type": "string"}, "count": {"type": "integer"},
+         "keeper": {"type": "boolean"}}}},
     {"name": "save_memory",
      "description": "Remember a lasting fact about the league or its people for future "
                     "conversations: nicknames, which Discord user owns which team, rivalries, "
@@ -1203,6 +1236,10 @@ class Brain:
                          "using MFL injury data instead.")
         mfl_inj = await self._injuries()
         depth_cache = {}
+        try:
+            pa_table = await self._points_allowed()
+        except Exception:
+            pa_table = {}
 
         out = [f"NFL week {week} start/sit research:"]
         for pid in ids:
@@ -1216,6 +1253,12 @@ class Brain:
                 opp, home, ko = g
                 when = datetime.fromtimestamp(int(ko), self.bot["CENTRAL"]).strftime("%a %I:%M %p CT") if ko else ""
                 line.append(f"matchup: {'vs' if home else '@'} {opp} {when}")
+                pa_pos = self._pa_pos(pa_table, p["pos"]) if pa_table else None
+                if pa_pos:
+                    r, n = self._pa_ranks(pa_table, pa_pos)
+                    if opp in r:
+                        line.append(f"{opp} allows {r[opp][0]:.1f} pts to {pa_pos} this season "
+                                    f"(#{r[opp][1]} of {n}; #1 = softest matchup)")
             else:
                 line.append("matchup: BYE or no game found this week")
             # Injury: RotoWire first, MFL as backup
@@ -2756,6 +2799,170 @@ class Brain:
                        f"${p.get('salary', '?')}" + (f", injury: {injuries[p['id']]}" if injuries.get(p['id']) else ""))
         return "\n".join(out)
 
+    # -- MFL-wide public data: points allowed, byes, trends, ADP/AAV --
+    async def _points_allowed(self):
+        d = await self.mfl.get("pointsAllowed", max_age=3600)
+        table = {}
+        for t in self.as_list((d.get("pointsAllowed") or {}).get("team")):
+            table[t.get("id")] = {x.get("name"): float(x.get("points") or 0)
+                                  for x in self.as_list(t.get("position"))}
+        return table
+
+    def _pa_pos(self, table, position):
+        """Match a position name to the labels MFL uses in pointsAllowed."""
+        have = {pos for row in table.values() for pos in row}
+        pos = (position or "").upper()
+        for cand in (pos, self._pos_key(pos), pos.replace("TM", "")):
+            if cand in have:
+                return cand
+        return None
+
+    def _pa_ranks(self, table, pos):
+        """NFL team -> (points allowed, rank) where rank 1 = allowed the MOST (softest matchup)."""
+        rows = sorted(((t, r[pos]) for t, r in table.items() if pos in r), key=lambda x: -x[1])
+        return {t: (pts, i + 1) for i, (t, pts) in enumerate(rows)}, len(rows)
+
+    async def points_allowed(self, position=None, nfl_team=None):
+        table = await self._points_allowed()
+        if not table:
+            return "MFL returned no points-allowed data yet."
+        have = sorted({pos for row in table.values() for pos in row})
+        out = []
+        if nfl_team:
+            t = nfl_team.upper()
+            t = t if t in table else next((k for k in table if STD_TEAM.get(k, k) == t or k.startswith(t)), None)
+            if not t:
+                return f"No NFL team {nfl_team}. Codes: {', '.join(sorted(table))}"
+            out.append(f"{t} defense - fantasy points allowed this season (rank of {len(table)}; 1 = gives up the most = softest):")
+            for pos in have:
+                r, n = self._pa_ranks(table, pos)
+                if t in r:
+                    out.append(f"- {pos}: {r[t][0]:.1f} pts (rank {r[t][1]} of {n})")
+        if position:
+            pos = self._pa_pos(table, position)
+            if not pos:
+                return f"No points-allowed data for {position}. Positions: {', '.join(have)}"
+            r, n = self._pa_ranks(table, pos)
+            rows = sorted(r.items(), key=lambda kv: kv[1][1])
+            out.append(f"Fantasy points allowed to {pos} by NFL defense, {self.bot['YEAR']} "
+                       f"(Blue Chip scoring; #1 = softest matchup, #{n} = toughest):")
+            out += [f"{rk}. {t}: {pts:.1f}" for t, (pts, rk) in rows]
+        if not out:
+            return "Give a position and/or an NFL team. Positions: " + ", ".join(have)
+        return "\n".join(out)
+
+    async def _bye_map(self):
+        d = await self.mfl.get("nflByeWeeks", max_age=86400, host=self.bot["API_HOST"])
+        return {t.get("id"): int(t.get("bye_week") or 0)
+                for t in self.as_list((d.get("nflByeWeeks") or {}).get("team"))}
+
+    async def bye_weeks(self, week=None, nfl_team=None, team=None):
+        byes = await self._bye_map()
+        if not byes:
+            return "MFL returned no bye weeks."
+        if nfl_team:
+            t = nfl_team.upper()
+            t = t if t in byes else next((k for k in byes if STD_TEAM.get(k, k) == t or k.startswith(t)), None)
+            return f"{t} bye: week {byes[t]}" if t else f"No NFL team {nfl_team}."
+        if week is None and team:
+            week, _ = await self._current_week()
+        if week is None:
+            by = {}
+            for t, w in byes.items():
+                by.setdefault(w, []).append(t)
+            return f"{self.bot['YEAR']} NFL bye weeks:\n" + "\n".join(
+                f"- Week {w}: {', '.join(sorted(ts))}" for w, ts in sorted(by.items()))
+        week = int(week)
+        off = sorted(t for t, w in byes.items() if w == week)
+        out = [f"Week {week} byes: " + (", ".join(off) if off else "none")]
+        if team and off:
+            fid, _ = await self._team_id(team)
+            if not fid:
+                return "\n".join(out + [f"(Couldn't find Blue Chip team '{team}'.)"])
+            players = await self.mfl.players()
+            teams = await self.mfl.teams()
+            mine = [(pid, e) for pid, (f, e) in (await self.mfl.owners()).items() if f == fid]
+            hit = [f"- {players.get(pid, {}).get('name', pid)} ({players.get(pid, {}).get('pos', '')} "
+                   f"{players.get(pid, {}).get('team', '')}){' [' + e.get('status') + ']' if e.get('status') not in (None, '', 'ROSTER') else ''}"
+                   for pid, e in mine if players.get(pid, {}).get("team") in off]
+            out.append(f"{teams.get(fid, fid)} players on bye in week {week}: " + (str(len(hit)) if hit else "none"))
+            out += hit
+        return "\n".join(out)
+
+    async def trending_players(self, kind="adds", position=None, count=20, free_agents_only=False):
+        typ = {"adds": "topAdds", "drops": "topDrops", "owned": "topOwns", "owns": "topOwns"}.get(kind, "topAdds")
+        d = await self.mfl.get(typ, max_age=3600, host=self.bot["API_HOST"])
+        rows = self.as_list((d.get(typ) or {}).get("player"))
+        players = await self.mfl.players()
+        owners = await self.mfl.owners()
+        teams = await self.mfl.teams()
+        pos = self._pos_key(position) if position else None
+        n = max(1, min(int(count or 20), 40))
+        label = {"topAdds": "most added", "topDrops": "most dropped", "topOwns": "most owned"}[typ]
+        out = [f"MFL-wide {label} players (% of all MFL leagues){' at ' + pos if pos else ''}"
+               f"{' - Blue Chip free agents only' if free_agents_only else ''}:"]
+        for r in rows:
+            info = players.get(r.get("id"))
+            if not info or (pos and self._pos_key(info["pos"]) != pos):
+                continue
+            own = owners.get(r["id"])
+            if free_agents_only and own:
+                continue
+            where = f"Blue Chip: {teams.get(own[0], own[0])}" if own else "Blue Chip: FREE AGENT"
+            out.append(f"- {info['name']} ({info['pos']} {info['team']}): {float(r.get('percent') or 0):.1f}% | {where}")
+            if len(out) > n:
+                break
+        if len(out) == 1:
+            out.append("none matched")
+        return "\n".join(out)
+
+    async def market_values(self, kind="adp", players=None, position=None, count=25, keeper=False):
+        typ = "aav" if (kind or "").lower() == "aav" else "adp"
+        rows, note = [], ""
+        for params in (({"IS_KEEPER": "K"} if keeper else None), {}):
+            if params is None:
+                continue
+            d = await self.mfl.get(typ, max_age=21600, host=self.bot["API_HOST"], **params)
+            body = d.get(typ) or {}
+            rows = self.as_list(body.get("player"))
+            if rows:
+                total = body.get("totalDrafts") or body.get("totalAuctions") or body.get("totalPicks") or body.get("totalPlayers")
+                note = ("keeper/dynasty leagues" if params else "all MFL leagues") + (f", sample {total}" if total else "")
+                break
+        if not rows:
+            return f"MFL has no {typ.upper()} data right now."
+        pl = await self.mfl.players()
+        owners = await self.mfl.owners()
+        teams = await self.mfl.teams()
+        def fmt(r):
+            info = pl.get(r["id"], {"name": f"Player #{r['id']}", "pos": "", "team": ""})
+            own = owners.get(r["id"])
+            bc = f"Blue Chip: {teams.get(own[0], own[0])}" if own else "Blue Chip: FA"
+            if typ == "adp":
+                v = (f"ADP {r.get('averagePick')} (range {r.get('minPick')}-{r.get('maxPick')}, "
+                     f"drafted in {r.get('draftSelPct')}% of drafts)")
+            else:
+                v = (f"AAV {r.get('averageValue')} (range {r.get('minValue')}-{r.get('maxValue')}, "
+                     f"bought in {r.get('auctionSelPct')}% of auctions)")
+            return f"#{r.get('rank')} {info['name']} ({info['pos']} {info['team']}): {v} | {bc}"
+        head = f"MFL-wide {typ.upper()} {self.bot['YEAR']} ({note}). Market context only, not Blue Chip salaries."
+        if players:
+            out = [head]
+            by_id = {r["id"]: r for r in rows}
+            for name in players[:10]:
+                words = name.lower().split()
+                hits = [pid for pid, p in pl.items() if all(w in p["name"].lower() for w in words)]
+                hits.sort(key=lambda pid: (pid not in by_id, pid not in owners))
+                if hits and hits[0] in by_id:
+                    out.append("- " + fmt(by_id[hits[0]]))
+                else:
+                    out.append(f"- {name}: not in MFL's {typ.upper()} list (undrafted in the sample)")
+            return "\n".join(out)
+        pos = self._pos_key(position) if position else None
+        n = max(1, min(int(count or 25), 50))
+        sel = [r for r in rows if not pos or self._pos_key(pl.get(r["id"], {}).get("pos", "")) == pos][:n]
+        return "\n".join([head + (f" Position: {pos}." if pos else "")] + ["- " + fmt(r) for r in sel])
+
     async def calculator(self, expression):
         import ast, operator as op
         ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
@@ -2810,6 +3017,10 @@ HOUSE_RULES = """
 - Trade opinions: look up both sides (player_info / team_roster, plus picks), weigh age,
   position scarcity in this IDP dynasty format, recent scoring, salary/contract and cap
   room, and each team's contender/rebuild status. Give a clear verdict, then why.
+- Matchups, byes, trends, market: points_allowed for defense-vs-position strength; bye_weeks
+  for who's off (and a Blue Chip team's players on bye); trending_players for MFL-wide
+  adds/drops/ownership; market_values for MFL-wide ADP/AAV. Those last two are across ALL
+  MFL leagues - say so, and never confuse them with Blue Chip salaries or results.
 - Start/sit and lineup questions: ALWAYS call start_sit_research for every player being
   compared (use team_roster first if they ask about "my team"). Weigh, in order: injury
   status (RotoWire), role on the Ourlads ACTIVE depth chart, matchup, MFL projection,
