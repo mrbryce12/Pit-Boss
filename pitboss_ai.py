@@ -347,7 +347,7 @@ TOOLS = [
      "description": "When each owner last visited the MFL league site (who's online, who's gone quiet).",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "history_draft",
-     "description": "Rookie draft results for any past Blue Chip season (2014 onward): by team, round or player.",
+     "description": "Rookie draft results for any completed Blue Chip draft (2014 onward, INCLUDING this year's): by team, round or player.",
      "input_schema": {"type": "object", "properties": {
          "year": {"type": "integer"}, "team": {"type": "string"}, "round": {"type": "integer"},
          "player": {"type": "string"}}, "required": ["year"]}},
@@ -420,6 +420,16 @@ TOOLS = [
     {"name": "league_cap_table",
      "description": "Every team's cap number and cap room, ranked, this season or next season (rollover rules).",
      "input_schema": {"type": "object", "properties": {"next_season": {"type": "boolean"}}}},
+    {"name": "future_picks",
+     "description": "Future draft picks: how many each team owns and which rounds (all teams), one team's picks "
+                    "(own vs acquired, plus picks traded away), or who owns a given team's pick (original_team).",
+     "input_schema": {"type": "object", "properties": {
+         "team": {"type": "string"}, "round": {"type": "integer"}, "year": {"type": "integer"},
+         "original_team": {"type": "string", "description": "Whose ORIGINAL pick to track, e.g. 'Wu-Tang' -> who owns Wu-Tang's 1st"}}}},
+    {"name": "projected_draft_order",
+     "description": "Projected next rookie draft order if the season ended today (rule 14): lottery picks with "
+                    "ball odds, every pick slot, who currently owns it, and the rookie salary for the slot.",
+     "input_schema": {"type": "object", "properties": {"round": {"type": "integer", "description": "1-6, default 1"}}}},
     {"name": "save_memory",
      "description": "Remember a lasting fact about the league or its people for future "
                     "conversations: nicknames, which Discord user owns which team, rivalries, "
@@ -1997,6 +2007,109 @@ class Brain:
         out += [f"{i}. {teams.get(f)}: ${v:,.2f} -> room ${cap - v:,.2f}" for i, (f, v) in enumerate(rows, 1)]
         return "\n".join(out)
 
+    # -- Draft picks: who owns what, projected draft order (rule book 14) --
+    ROOKIE_SALARY_R1 = [(1, 86), (3, 78), (6, 69), (9, 61), (16, 52), (24, 35), (32, 26)]  # 14m: last pick, $
+    ROOKIE_SALARY = {2: 17, 3: 8, 4: 6, 5: 4, 6: 2}
+    LOTTERY_BALLS = [8, 7, 6, 5, 4, 3, 2, 1]   # 14b: PP rank 32 down to 25
+
+    def _rookie_salary(self, rnd, pick):
+        if rnd == 1:
+            return next(s for last, s in self.ROOKIE_SALARY_R1 if pick <= last)
+        return self.ROOKIE_SALARY.get(rnd, 0)
+
+    async def _future_picks(self):
+        d = await self.mfl.get("futureDraftPicks", max_age=300)   # live: re-read every 5 min (trades)
+        out = []
+        for fr in self.as_list((d.get("futureDraftPicks") or {}).get("franchise")):
+            for p in self.as_list(fr.get("futureDraftPick")):
+                out.append({"owner": fr["id"], "orig": p.get("originalPickFor"),
+                            "year": int(p.get("year") or 0), "round": int(p.get("round") or 0)})
+        return out
+
+    async def future_picks(self, team=None, round=None, year=None, original_team=None):
+        teams = await self.mfl.teams()
+        picks = await self._future_picks()
+        if year:
+            picks = [p for p in picks if p["year"] == int(year)]
+        if round:
+            picks = [p for p in picks if p["round"] == int(round)]
+        if original_team:
+            of = self.bot["find_team"](original_team, teams)
+            picks = [p for p in picks if p["orig"] == of]
+            if not picks:
+                return f"No matching picks originally belonging to {teams.get(of, original_team)}."
+            return "\n".join(f"{p['year']} round {p['round']} pick of {teams.get(p['orig'])} is owned by "
+                             f"{teams.get(p['owner'])}" for p in sorted(picks, key=lambda x: (x["year"], x["round"])))
+        years = sorted({p["year"] for p in picks})
+        ordn = lambda r: {1: "1st", 2: "2nd", 3: "3rd"}.get(r, f"{r}th")
+        if team:
+            fid = self.bot["find_team"](team, teams)
+            if not fid:
+                return f"No team matches '{team}'."
+            mine = sorted([p for p in picks if p["owner"] == fid], key=lambda x: (x["year"], x["round"]))
+            gone = sorted([p for p in picks if p["orig"] == fid and p["owner"] != fid],
+                          key=lambda x: (x["year"], x["round"]))
+            out = [f"{teams[fid]} owns {len(mine)} future pick(s) ({', '.join(map(str, years))}):"]
+            out += [f"- {p['year']} {ordn(p['round'])}" + (" (own)" if p["orig"] == fid else
+                                                          f" (from {teams.get(p['orig'])})") for p in mine]
+            if gone:
+                out.append("Traded away: " + "; ".join(f"{p['year']} {ordn(p['round'])} -> {teams.get(p['owner'])}"
+                                                      for p in gone))
+            return "\n".join(out)
+        rows = []
+        for fid, name in teams.items():
+            mine = [p for p in picks if p["owner"] == fid]
+            by_r = {}
+            for p in mine:
+                by_r[p["round"]] = by_r.get(p["round"], 0) + 1
+            rounds = ", ".join(f"{ordn(r)} x{n}" if n > 1 else ordn(r) for r, n in sorted(by_r.items())) or "none"
+            rows.append((len(mine), name, rounds, by_r.get(1, 0)))
+        rows.sort(key=lambda x: (-x[0], x[1].lower()))
+        out = [f"Future draft picks owned by each team ({', '.join(map(str, years)) or 'none listed'}; "
+               f"MFL only lists years it tracks), most first:"]
+        out += [f"- {name}: {n} pick(s) [{rounds}]" for n, name, rounds, _ in rows]
+        return "\n".join(out)
+
+    async def projected_draft_order(self, round=1):
+        """Projected next rookie draft if the season ended today (rule 14b/14c), with pick owners."""
+        teams = await self.mfl.teams()
+        lg = (await self.mfl.get("league", max_age=86400))["league"]
+        division_of = {f["id"]: f.get("division") for f in self.as_list(lg["franchises"]["franchise"])}
+        d = await self.mfl.get("leagueStandings", max_age=600)
+        standings = self.as_list(d["leagueStandings"]["franchise"])
+        seeds, _ = self.bot["playoff_picture"](standings, division_of)
+        playoff_ids = {r["id"] for _, r, _ in seeds}
+        num = lambda r, k: float(r.get(k) or 0)
+        non_po = sorted([r for r in standings if r["id"] not in playoff_ids], key=lambda r: num(r, "pp"))
+        po = sorted([r for r in standings if r["id"] in playoff_ids], key=lambda r: num(r, "pf"))
+        order = [r["id"] for r in non_po] + [r["id"] for r in po]
+        rnd = int(round or 1)
+        nxt = int(self.bot["YEAR"]) + 1
+        owners = {(p["orig"], p["round"]): p["owner"] for p in await self._future_picks() if p["year"] == nxt}
+        out = [f"PROJECTED {nxt} rookie draft, round {rnd}, if the season ended today (rule 14). "
+               f"Non-playoff teams pick by lowest Potential Points; playoff teams after them by points scored; "
+               f"the two Super Bowl teams will end up at picks 31-32."]
+        lottery = non_po[:8]
+        if rnd == 1 and lottery:
+            total = sum(self.LOTTERY_BALLS[:len(lottery)])
+            out.append(f"Picks 1.01-1.08 are a weighted LOTTERY (14b), {total} balls total. Order below is "
+                       f"before the lottery (most balls first).")
+        for i, fid in enumerate(order, 1):
+            owner = owners.get((fid, rnd), fid)
+            line = f"{rnd}.{i:02d} {teams.get(fid)}"
+            if owner != fid:
+                line += f" -> owned by {teams.get(owner)}"
+            if rnd == 1 and i <= len(lottery):
+                balls = self.LOTTERY_BALLS[i - 1]
+                line += f" [{balls} lottery ball{'s' if balls > 1 else ''}, {balls / total:.0%} for 1.01]"
+            if fid in playoff_ids:
+                line += " (playoff team)"
+            line += f" | rookie salary ${self._rookie_salary(rnd, i)}"
+            out.append(line)
+        out.append("Rookie salaries per rule 14m (raised 15% after each 3-year super pot; 2028 is next). "
+                   "Ties use the Godfather tiebreakers (14d).")
+        return "\n".join(out)
+
     async def run(self, name, args, ctx):
         if name == "save_memory":
             item = add_memory(args.get("fact", ""), ctx["author"], ctx["is_trainer"])
@@ -2038,6 +2151,8 @@ HOUSE_RULES = """
   This league has no individual QBs/kickers/punters: QB, PK and PN are NFL team units (TMQB/TMPK/TMPN).
 - League-wide comparisons: team_rankings (power/luck/consistency/PA), weekly_records, head_to_head,
   position_strength, league_cap_table, trade_compare (trade math). One call, then talk.
+- Draft picks: future_picks (counts, rounds, who owns whose pick), projected_draft_order (next draft),
+  history_draft (any completed draft, including this year's). Never say picks can't be looked up.
 - What-ifs are your job, not a reason to refuse. 'If the season ended week N', 'what if X wins out',
   'what if X beats Y': use what_if_playoffs (standings/bracket), team_salary options (cap), holdout_report
   through_week, or history tools. Label the answer as a what-if. Only refuse if no tool can model it,
