@@ -61,6 +61,18 @@ MAX_MEMORIES_IN_PROMPT = 150
 TRAINER_ROLE = "Pit Boss Trainer"
 SALARY_ESCALATION = 0.20            # league rollover: player salaries grow 20% a year (rule book 9k)
 CAP_ESCALATION = 0.05               # league rollover: the salary cap grows 5% every April 1 (rule 8d)
+# Rule book tiers (section 10 tags, section 12 holdouts): how many highest-paid players
+# at each position are averaged. Team QB/PK/PN = TMQB/TMPK/TMPN in MFL.
+_F = {"TMQB": 10, "TE": 10, "DT": 10, "TMPK": 10, "TMPN": 10,
+      "RB": 15, "DE": 15, "CB": 15, "S": 15, "WR": 20, "LB": 20}
+TAG_TIERS = {
+    "franchise": dict(_F),                                   # 10a.6 (exclusive 10c.5 uses the same)
+    "transition": {k: v * 2 for k, v in _F.items()},         # 10b.5: top 20 / 30 / 40
+    "holdout": {k: v for k, v in _F.items() if k not in ("TMPK", "TMPN")},  # 12c
+}
+TIER_RULE = {"franchise": "rule 10a.6 / 10c.5: franchise + exclusive tags",
+             "transition": "rule 10b.5: transition tag",
+             "holdout": "rule 12c-e: holdouts; Stage 1 threshold = half the average"}
 # Rule 4h: every player must come off IR by April 1, so next season IR salaries count 100%.
 # Rule 11e: taxi (DTS) players count 25%. Rule 9k: franchise-tagged salaries follow the tag formula.
 # Channels where AI chat works. Empty = everywhere. Example: [123456789012345678]
@@ -279,6 +291,26 @@ TOOLS = [
          "team": {"type": "string", "description": "NFL team code as MFL uses it, e.g. ATL, KCC, SFO"},
          "position": {"type": "string", "description": "Optional, e.g. RB, WR, LB"}},
          "required": ["team"]}},
+    {"name": "position_tiers",
+     "description": "League-wide salary tier averages by position, computed from every rostered "
+                    "player's current salary: franchise/exclusive tag tiers (top 10/15/20), "
+                    "transition tiers (top 20/30/40) and holdout tiers. Use for any tier question.",
+     "input_schema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["all", "franchise", "transition", "holdout"]},
+         "position": {"type": "string", "description": "Optional: RB, WR, TE, DE, DT, LB, CB, S, QB, PK, PN"}}}},
+    {"name": "tag_price",
+     "description": "Exact franchise, exclusive and transition tag prices for a player per rule 10, "
+                    "with eligibility (contract must expire April 1) and the 3-year salaries.",
+     "input_schema": {"type": "object", "properties": {
+         "player": {"type": "string"}}, "required": ["player"]}},
+    {"name": "holdout_report",
+     "description": "Holdout candidates per rule 12: top-tier scorers paid under half their "
+                    "position's top-tier average salary, with immunity checks and the Stage 1 / "
+                    "Stage 2 salary. Can project as if the season ended after a given week.",
+     "input_schema": {"type": "object", "properties": {
+         "team": {"type": "string", "description": "Optional: one team"},
+         "through_week": {"type": "integer", "description": "Optional: 'if the season ended week N'"},
+         "position": {"type": "string"}}}},
     {"name": "save_memory",
      "description": "Remember a lasting fact about the league or its people for future "
                     "conversations: nicknames, which Discord user owns which team, rivalries, "
@@ -966,6 +998,155 @@ class Brain:
                 out.append(f"\n{titles[sec]}:\n" + "\n".join(lines))
         return "\n".join(out)
 
+    # -- League calculators: salary tiers, tags, holdouts (rule book 10 & 12) --
+    async def _league_salaries(self):
+        """Every rostered player in the league with salary/contract info."""
+        players = await self.mfl.players()
+        out = []
+        for fr in await self.mfl.rosters():
+            for e in self.as_list(fr.get("player")):
+                p = players.get(e["id"], {"name": f"Player #{e['id']}", "pos": "?", "team": ""})
+                try:
+                    sal = float(str(e.get("salary") or 0).replace("$", "").replace(",", ""))
+                except ValueError:
+                    sal = 0.0
+                out.append({"id": e["id"], "fid": fr["id"], "name": p["name"], "pos": p["pos"],
+                            "nfl": p["team"], "salary": sal, "status": e.get("status", "ROSTER"),
+                            "left": e.get("contractInfo"), "length": e.get("contractYear"),
+                            "note": str(e.get("contractStatus") or "").strip(),
+                            "drafted": str(e.get("drafted") or "")})
+        return out
+
+    @staticmethod
+    def _pos_key(pos):
+        pos = (pos or "").upper()
+        return {"QB": "TMQB", "K": "TMPK", "PK": "TMPK", "P": "TMPN", "PN": "TMPN"}.get(pos, pos)
+
+    async def _tier_avg(self, pos, n):
+        """Average salary of the n highest-paid rostered players at a position."""
+        pays = sorted((r["salary"] for r in await self._league_salaries()
+                       if self._pos_key(r["pos"]) == pos), reverse=True)[:n]
+        return (sum(pays) / len(pays) if pays else 0.0), len(pays)
+
+    async def position_tiers(self, kind="all", position=None):
+        kinds = ["franchise", "transition", "holdout"] if kind in (None, "", "all") else [kind]
+        lines = [f"League-wide salary tiers from current {self.bot['YEAR']} salaries "
+                 f"(these become 'last season' tiers at the April 1 rollover):"]
+        for k in kinds:
+            tiers = TAG_TIERS.get(k, {})
+            lines.append(f"\n{k.upper()} tiers ({TIER_RULE[k]}):")
+            for pos, n in tiers.items():
+                if position and self._pos_key(position) != pos:
+                    continue
+                avg, cnt = await self._tier_avg(pos, n)
+                half = f", half = ${avg / 2:,.2f}" if k == "holdout" else ""
+                lines.append(f"- {pos}: top {n} average ${avg:,.2f}{half}"
+                             + (f" (only {cnt} rostered)" if cnt < n else ""))
+        return "\n".join(lines)
+
+    async def tag_price(self, player):
+        rows = await self._league_salaries()
+        words = player.lower().split()
+        hits = [r for r in rows if all(w in r["name"].lower() for w in words)]
+        if not hits:
+            return f"No rostered player matches '{player}'."
+        teams = await self.mfl.teams()
+        out = []
+        for r in hits[:3]:
+            pos = self._pos_key(r["pos"])
+            raise20 = round(r["salary"] * (1 + SALARY_ESCALATION), 2)
+            f_avg, _ = await self._tier_avg(pos, TAG_TIERS["franchise"].get(pos, 15))
+            t_avg, _ = await self._tier_avg(pos, TAG_TIERS["transition"].get(pos, 30))
+            e_avg = f_avg  # exclusive uses the same top-10/15/20 tiers as the franchise tag
+            fr1 = round(f_avg, 2)
+            ex1 = round(max(e_avg, raise20), 2)
+            tr1 = round(max(t_avg, raise20), 2)
+            eligible = str(r["left"]).strip() == "1"
+            tagged_before = r["note"].lower().count("franchise tag")
+            lines = [f"{r['name']} ({r['pos']} {r['nfl']}) - {teams.get(r['fid'], r['fid'])}, "
+                     f"salary ${r['salary']:,.2f}, {r['left']} yr left"
+                     + (f", note: {r['note']}" if r['note'] else ""),
+                     ("Eligible: contract expires April 1 (1 yr left)." if eligible else
+                      "NOT eligible yet: tags only apply to contracts expiring April 1 (1 yr left now)."),
+                     f"- Franchise tag (rule 10a): bidding opens at ${fr1:,.2f} (top "
+                     f"{TAG_TIERS['franchise'].get(pos)} {pos} average); year 1 = the higher of that or the "
+                     f"winning bid; 3-yr deal, years 2-3 +20% -> ${fr1 * 1.2:,.2f}, ${fr1 * 1.44:,.2f} "
+                     f"(if no higher bid). Bidders need a 1st-round pick; owner can match.",
+                     f"- Exclusive franchise tag (10c): ${ex1:,.2f} (higher of top "
+                     f"{TAG_TIERS['franchise'].get(pos)} average ${e_avg:,.2f} or salary +20% "
+                     f"${raise20:,.2f}); 3-yr deal -> ${ex1 * 1.2:,.2f}, ${ex1 * 1.44:,.2f}; then UFA.",
+                     f"- Transition tag (10b): ${tr1:,.2f} (higher of top "
+                     f"{TAG_TIERS['transition'].get(pos)} average ${t_avg:,.2f} or salary +20% "
+                     f"${raise20:,.2f}); 1-yr deal; then UFA."]
+            if tagged_before:
+                lines.append(f"CHECK: contract notes mention a franchise tag {tagged_before}x - a player "
+                             "can only be franchise tagged twice (10a.13).")
+            out.append("\n".join(lines))
+        out.append("Tiers use current salaries, which are the 'prior year' salaries at the April 1 "
+                   "rollover. Final numbers can shift if salaries change before then.")
+        return "\n\n".join(out)
+
+    async def _points_by_pos(self, pos, through_week=None):
+        """{player id: fantasy points} at a position, season-to-date or weeks 1..N."""
+        if not through_week:
+            d = await self.mfl.get("playerScores", max_age=900, W="YTD", POSITION=pos, COUNT="300")
+            return {s["id"]: float(s.get("score") or 0) for s in
+                    self.as_list(d.get("playerScores", {}).get("playerScore"))}
+        total = {}
+        for w in range(1, int(through_week) + 1):
+            d = await self.mfl.get("playerScores", max_age=3600, W=str(w), POSITION=pos, COUNT="300")
+            for s in self.as_list(d.get("playerScores", {}).get("playerScore")):
+                total[s["id"]] = total.get(s["id"], 0.0) + float(s.get("score") or 0)
+        return total
+
+    async def holdout_report(self, team=None, through_week=None, position=None):
+        rows = {r["id"]: r for r in await self._league_salaries()}
+        teams = await self.mfl.teams()
+        fid = None
+        if team:
+            fid, _ = await self._team_id(team)
+            if not fid:
+                return f"No team matches '{team}'."
+        year = int(self.bot["YEAR"])
+        span = f"weeks 1-{through_week}" if through_week else "season to date"
+        found = [f"Holdout check (rule 12), points {span}, salaries {year}:"]
+        for pos, n in TAG_TIERS["holdout"].items():
+            if position and self._pos_key(position) != pos:
+                continue
+            pts = await self._points_by_pos(pos, through_week)
+            top = sorted(pts.items(), key=lambda x: -x[1])[:n]
+            avg, _ = await self._tier_avg(pos, n)
+            for rank, (pid, score) in enumerate(top, 1):
+                r = rows.get(pid)
+                if not r or (fid and r["fid"] != fid):
+                    continue
+                if r["salary"] >= avg / 2:
+                    continue
+                m = re.search(r"\((\d{4})\)", r["drafted"])
+                rookie = bool(m and not r["drafted"].lower().startswith("auction")
+                              and year - int(m.group(1)) < 2)
+                five = (str(r["length"]) == "5" and str(r["left"]).isdigit()
+                        and int(r["length"]) - int(r["left"]) < 2)
+                stage1_before = bool(re.search(r"S1\s*HO|stage\s*1|holdout", r["note"], re.I))
+                raise20 = r["salary"] * (1 + SALARY_ESCALATION)
+                if rookie or five:
+                    why = "rookie (first 2 years)" if rookie else "5-yr contract (first 2 years)"
+                    verdict = f"IMMUNE ({why}, rule 12a)"
+                elif stage1_before:
+                    verdict = (f"possible STAGE 2 (notes: {r['note']}): year-1 salary would be the full "
+                               f"top-{n} average ${avg:,.2f}, or reject to taxi, or waive (12i)")
+                else:
+                    verdict = (f"STAGE 1 holdout: new salary ${max(avg / 2, raise20):,.2f} "
+                               f"(higher of half the top-{n} average ${avg / 2:,.2f} or +20% "
+                               f"${raise20:,.2f}); contract years unchanged (12e)")
+                found.append(f"- {r['name']} {pos} ({teams.get(r['fid'])}): #{rank} at {pos} with "
+                             f"{score:.1f} pts, salary ${r['salary']:,.2f} < half of ${avg:,.2f} -> {verdict}")
+        if len(found) == 1:
+            found.append("No holdout candidates" + (" on that team." if fid else "."))
+        found.append("Official holdouts use end-of-season (week 17) stats; anything earlier is a projection. "
+                     "In-season extensions can also grant immunity (12a) - not checked here.")
+        return "\n".join(found)
+
     async def run(self, name, args, ctx):
         if name == "save_memory":
             item = add_memory(args.get("fact", ""), ctx["author"], ctx["is_trainer"])
@@ -1001,6 +1182,9 @@ HOUSE_RULES = """
   failed to load, say so.
 - Contracts: "years" means YEARS REMAINING (shown as "N yr left"); the original deal length is
   only background. Never call the original length "years left".
+- Tags, holdouts and salary tiers: ALWAYS use tag_price, holdout_report or position_tiers.
+  Tag and holdout prices come from SALARY tiers (current salaries = last season's at rollover);
+  holdout eligibility comes from POINTS rank. Never say you cannot calculate these.
 - Money/cap questions: ALWAYS use team_salary and report its numbers. Never add up salaries yourself.
   This season = current MFL data. Next season = next_season=true, which applies the league rollover:
   every salary +20% (rule book 9k), the cap +5% (8d), IR at full salary (4h: all off IR by April 1),
@@ -1013,6 +1197,8 @@ HOUSE_RULES = """
 - Long lists: summarize (totals + the top 10 or so) instead of listing every player, unless asked.
 - Keep answers short for Discord: usually under 120 words, bullet lists welcome.
   Longer only if asked. Use Discord markdown. No tables.
+- Stay in character: when someone teases or challenges you, open with a quick comeback (see
+  persona), then answer. Never sound like a cautious assistant.
 - Trash talk stays light and about fantasy football only. Never about anyone's real life,
   looks, family, money, health, religion, politics, etc. If someone asks you to roast a
   person that way, deflect with humor.
