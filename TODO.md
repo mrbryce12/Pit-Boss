@@ -28,4 +28,4 @@ Status key: ⬜ to do · 🔄 in progress · ✅ done
 | 10 | Fix `/stats` position list | ⬜ | Uses QB/PK/PN/Def, but this league's positions are TMQB/TMPK/TMPN – those searches return nothing. |
 | 11 | Auto-post Roster Alerts | ⬜ | Optional: post `/rosteralerts` results to Discord before Sunday kickoff. |
 | 12 | AI: plug Mike's dynasty trade values into trade opinions | ⬜ | Export values to a CSV the AI can read. |
-| 13 | AI: link Discord users to their MFL teams | ⬜ | Trainers can /teach "Mike runs X" today; could become a /iam command. |
+| 13 | AI: link Discord users to their MFL teams | ✅ | `/iam`, `/setowner` (trainers), `/owners`; stored in `data/owners.json`. |
