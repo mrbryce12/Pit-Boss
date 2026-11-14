@@ -544,7 +544,7 @@ def find_violations(league, rosters, adjustments, lineups, players, injuries, by
     return out
 
 
-async def send_roster_report(inter, team=None, include_lineups=True):
+async def build_roster_report(team=None, include_lineups=True):
     """
     Shared by /rosteralerts and /rosterviolations.
     team=None checks all teams; passing a team checks just that one (and adds
@@ -552,15 +552,15 @@ async def send_roster_report(inter, team=None, include_lineups=True):
     include_lineups=False -> only true roster violations (limits, cap, position limits).
     Always the CURRENT week: MFL only gives today's rosters and injuries,
     so checking an old week's lineups would flag players traded since.
+    Returns (embeds, found) – also used by the Saturday lineup reminder.
     """
-    await inter.response.defer()
     teams = await mfl.teams()
     only = None
     if team:
         only = find_team(team, teams)
         if not only:
-            await inter.followup.send(f"Couldn't find a team matching **{team}**.")
-            return
+            return [discord.Embed(description=f"Couldn't find a team matching **{team}**.",
+                                  color=GOLD)], {}
 
     league = (await mfl.get("league", max_age=3600))["league"]
     rosters = await mfl.rosters()
@@ -617,9 +617,7 @@ async def send_roster_report(inter, team=None, include_lineups=True):
                    f"({'over by' if pay > cap else 'room'} ${abs(cap - pay):,.2f})\n\n")
 
     if not found:
-        await inter.followup.send(embed=discord.Embed(
-            title=title, color=GOLD, description=summary + none_msg))
-        return
+        return [discord.Embed(title=title, color=GOLD, description=summary + none_msg)], found
 
     # One block per team, packed into as few embeds/messages as Discord allows.
     blocks = [f"**{teams.get(fid, fid)}**\n" + "\n".join(f"• {p}" for p in probs)
@@ -635,6 +633,13 @@ async def send_roster_report(inter, team=None, include_lineups=True):
     embeds = [discord.Embed(description=e, color=GOLD) for e in embeds]
     embeds[0].title = title
     embeds[-1].set_footer(text=f"{len(found)} team(s) flagged · {legend}")
+    return embeds, found
+
+
+async def send_roster_report(inter, team=None, include_lineups=True):
+    """Slash-command wrapper around build_roster_report()."""
+    await inter.response.defer()
+    embeds, _ = await build_roster_report(team, include_lineups)
     # Discord allows ~6000 characters per message, so send one embed per message.
     for e in embeds:
         await inter.followup.send(embed=e)
@@ -823,6 +828,709 @@ async def potentialpoints(inter: discord.Interaction):
     await inter.followup.send(embed=embed)
 
 
+# ---- /tradebait and /tradebaitall --------------------------------------------
+# MFL "tradeBait" export, one entry per team that has posted:
+#   franchise_id, willGiveUp (comma list of player ids / pick codes),
+#   inExchangeFor (free text), timestamp (last update, Unix seconds).
+# tradebait_embed() builds the one-team view. It is kept separate so the
+# planned auto-checker (TODO #14) can post the same card whenever a team
+# updates its trade bait.
+
+def bait_asset(code, players, teams):
+    """Readable text for one item a team will give up (player or pick)."""
+    if code.startswith("FP_"):            # future pick: FP_franchise_year_round
+        _, fr, yr, rd = code.split("_")
+        return f"{yr} Round {rd} pick ({teams.get(fr, fr)})"
+    if code.startswith("DP_"):            # current-year pick: DP_round_pick (0-based)
+        _, rd, pk = code.split("_")
+        return f"{YEAR} pick {int(rd) + 1}.{int(pk) + 1:02d}"
+    p = players.get(code)
+    return f"{p['name']} ({tag(p) or '?'})" if p else f"Player #{code}"
+
+
+def bait_when(ts):
+    try:
+        return datetime.fromtimestamp(int(ts), CENTRAL).strftime("%b %d, %Y")
+    except (TypeError, ValueError):
+        return "unknown date"
+
+
+async def trade_bait_entries():
+    """{franchise_id: entry} for every team with trade bait posted."""
+    d = await mfl.get("tradeBait", max_age=300)
+    out = {}
+    for b in as_list((d.get("tradeBaits") or {}).get("tradeBait")):
+        items = [x for x in (b.get("willGiveUp") or "").split(",") if x]
+        note = (b.get("inExchangeFor") or "").strip()
+        if items or note:
+            out[b["franchise_id"]] = {"items": items, "note": note, "ts": b.get("timestamp")}
+    return out
+
+
+def tradebait_embed(fid, entry, teams, players, roster_entries):
+    """One team's trade bait as a Discord card, players grouped by position."""
+    name = teams.get(fid, fid)
+    embed = discord.Embed(title=f"🎣 Trade Bait — {name}", color=GOLD,
+                          url=LEAGUE_URL)
+    embed.description = (f"**Looking for:** {entry['note'] or '—'}\n"
+                         f"Updated {bait_when(entry['ts'])}")
+    contract = {e["id"]: e for e in roster_entries}
+    groups = {}
+    for code in entry["items"]:
+        p = players.get(code)
+        pos = "Picks" if code[:3] in ("FP_", "DP_") else (p["pos"] if p else "Other")
+        line = bait_asset(code, players, teams)
+        c = contract.get(code)
+        if c and c.get("salary"):
+            line += f" — ${money(c['salary']):,.2f}"
+            # In this league contractInfo = YEARS REMAINING (contractYear = original length)
+            if c.get("contractInfo"):
+                line += f", {c['contractInfo']} yr left"
+        groups.setdefault(pos, []).append(line)
+    order = POS_ORDER + ["TMQB", "TMPK", "TMPN"]
+    for pos in sorted(groups, key=lambda x: (order.index(x) if x in order else 99, x)):
+        embed.add_field(name=pos, value="\n".join(groups[pos])[:1024], inline=False)
+    if not entry["items"]:
+        embed.add_field(name="Available", value="No specific players listed.", inline=False)
+    embed.set_footer(text=f"{len(entry['items'])} player(s)/pick(s) on the block")
+    return embed
+
+
+@tree.command(name="tradebait", description="One team's trade bait from MFL")
+@app_commands.describe(team="Start typing a team name")
+@app_commands.autocomplete(team=team_autocomplete)
+async def tradebait(inter: discord.Interaction, team: str):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    fid = find_team(team, teams)
+    if not fid:
+        await inter.followup.send(f"Couldn't find a team matching **{team}**.")
+        return
+    entries = await trade_bait_entries()
+    if fid not in entries:
+        await inter.followup.send(f"**{teams[fid]}** has no trade bait posted on MFL.")
+        return
+    players = await mfl.players()
+    fr = next((f for f in await mfl.rosters() if f["id"] == fid), {})
+    await inter.followup.send(embed=tradebait_embed(fid, entries[fid], teams, players,
+                                                    as_list(fr.get("player"))))
+
+
+@tree.command(name="tradebaitall", description="Every team's trade bait from MFL, most recently updated first")
+async def tradebaitall(inter: discord.Interaction):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    entries = await trade_bait_entries()
+    if not entries:
+        await inter.followup.send("No teams have trade bait posted on MFL.")
+        return
+    players = await mfl.players()
+
+    # One block per team, newest update first; players one per line.
+    blocks = []
+    for fid, e in sorted(entries.items(), key=lambda x: int(x[1]["ts"] or 0), reverse=True):
+        lines = [f"**{teams.get(fid, fid)}** · updated {bait_when(e['ts'])}",
+                 f"Looking for: {e['note'] or '—'}"]
+        lines += [f"• {bait_asset(c, players, teams)}" for c in e["items"]]
+        blocks.append("\n".join(lines))
+
+    # Pack blocks into embeds (Discord: 4096 chars per embed description).
+    chunks, cur = [], ""
+    for b in blocks:
+        b = b[:3900]
+        if len(cur) + len(b) + 2 > 3900:
+            chunks.append(cur)
+            cur = ""
+        cur += b + "\n\n"
+    chunks.append(cur)
+    embeds = [discord.Embed(description=c, color=GOLD) for c in chunks]
+    embeds[0].title = f"🎣 Blue Chip Trade Bait — {len(entries)} teams"
+    embeds[0].url = LEAGUE_URL
+    embeds[-1].set_footer(text="From MFL trade bait. Use /tradebait for one team with salaries.")
+    for e in embeds:                       # one embed per message (6000-char limit)
+        await inter.followup.send(embed=e)
+
+
+# ---- /ircheck: players on IR who are no longer IR-eligible -----------------
+# Blue Chip rule book, section 4:
+#   4b) Only players with an NFL injured-reserve designation on MFL can be on IR;
+#       team positions (Team QB/K/P) can never be on IR.
+#   4c) If a player's IR designation is lifted, he can't stay on IR - the owner
+#       must activate him or cut him.
+#   13h) Suspended players may also be put on IR.
+IR_ELIGIBLE = {"IR", "IR-R", "IR-PUP", "IR-NFI", "Suspended"}
+TEAM_POSITIONS = {"TMQB", "TMPK", "TMPN"}
+
+
+def ir_ineligible(rosters, players, injuries):
+    """{franchise_id: [(player_id, reason), ...]} for IR players who must come off IR."""
+    out = {}
+    for fr in rosters:
+        for e in as_list(fr.get("player")):
+            if e.get("status") != "INJURED_RESERVE":
+                continue
+            pid = e["id"]
+            pos = players.get(pid, {}).get("pos", "")
+            status = injuries.get(pid, "")
+            if pos in TEAM_POSITIONS:
+                reason = "team positions can never be on IR"
+            elif status in IR_ELIGIBLE:
+                continue                      # still eligible
+            elif status:
+                reason = f"listed **{status}**, not IR"
+            else:
+                reason = "no injury designation (healthy)"
+            out.setdefault(fr["id"], []).append((pid, reason))
+    return out
+
+
+@tree.command(name="ircheck", description="All teams: players on IR who are no longer IR-eligible and must be activated or cut")
+async def ircheck(inter: discord.Interaction):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    rosters = await mfl.rosters()
+    players = await mfl.players()
+    inj = await mfl.get("injuries", max_age=1800, host=API_HOST)
+    injuries = {i["id"]: i.get("status", "")
+                for i in as_list((inj.get("injuries") or {}).get("injury"))}
+    adj = await mfl.get("salaryAdjustments", max_age=600)
+    adjustments = {}
+    for a in as_list((adj.get("salaryAdjustments") or {}).get("salaryAdjustment")):
+        adjustments[a["franchise_id"]] = adjustments.get(a["franchise_id"], 0.0) + money(a.get("amount"))
+
+    found = ir_ineligible(rosters, players, injuries)
+    title = "🚑 IR Eligibility Check — All teams"
+    if not found:
+        await inter.followup.send(embed=discord.Embed(
+            title=title, color=GOLD,
+            description="✅ Every player on IR has an IR (or suspension) designation."))
+        return
+
+    max_active = int(league.get("rosterSize") or 0)
+    cap = money(league.get("salaryCapAmount"))
+    ir_pct = money(league.get("includeIRWithSalary") or 100) / 100
+    by_id = {f["id"]: f for f in rosters}
+
+    blocks = []
+    for fid, items in sorted(found.items(), key=lambda x: teams.get(x[0], x[0]).lower()):
+        fr = by_id[fid]
+        entries = {e["id"]: e for e in as_list(fr.get("player"))}
+        lines = [f"**{teams.get(fid, fid)}**"]
+        extra_salary = 0.0
+        for pid, reason in items:
+            p = players.get(pid)
+            name = f"{p['name']} ({tag(p) or '?'})" if p else f"Player #{pid}"
+            sal = money(entries.get(pid, {}).get("salary"))
+            extra_salary += sal * (1 - ir_pct)    # cap hit goes from 25% to 100%
+            lines.append(f"• {name} — {reason} · ${sal:,.2f}")
+        # What happens if they activate everyone listed above?
+        active_now = sum(1 for e in entries.values() if e.get("status", "ROSTER") == "ROSTER")
+        active_after = active_now + len(items)
+        pay_after = team_payroll(fr, league, adjustments) + extra_salary
+        notes = [f"Active roster {active_now} → **{active_after}**/{max_active}"
+                 + (f" (must cut {active_after - max_active})" if max_active and active_after > max_active else "")]
+        notes.append(f"Cap after activating **${pay_after:,.2f}** / ${cap:,.2f}"
+                     + (f" (**over by ${pay_after - cap:,.2f}**)" if pay_after > cap else
+                        f" (room ${cap - pay_after:,.2f})"))
+        lines.append("↳ " + " · ".join(notes))
+        blocks.append("\n".join(lines))
+
+    chunks, cur = [], ""
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 3900:
+            chunks.append(cur)
+            cur = ""
+        cur += b + "\n\n"
+    chunks.append(cur)
+    embeds = [discord.Embed(description=c, color=GOLD) for c in chunks]
+    embeds[0].title = title
+    total = sum(len(v) for v in found.values())
+    embeds[-1].set_footer(text=f"{total} player(s) on {len(found)} team(s) must be activated or cut "
+                               "(rule book §4b–c). Eligible: IR, IR-R, IR-PUP, IR-NFI, Suspended.")
+    for e in embeds:
+        await inter.followup.send(embed=e)
+
+
+# ============================================================================
+# Standard league reports: /recap, /matchups, /powerrankings, /capspace,
+# /capnextyear, /owneractivity, /trades, and the Saturday lineup reminder.
+# ============================================================================
+import json as _json
+from discord.ext import tasks
+
+TEAM_POS = {"TMQB", "TMPK", "TMPN"}
+
+
+def num(x):
+    """MFL numbers come as strings (sometimes blank or with $) -> float."""
+    try:
+        return float(str(x or 0).replace("$", "").replace(",", "") or 0)
+    except ValueError:
+        return 0.0
+
+
+async def current_week():
+    """Current NFL week number from MFL's NFL schedule (e.g. 10)."""
+    sched = (await mfl.get("nflSchedule", max_age=600, host=API_HOST)).get("nflSchedule", {})
+    try:
+        return int(sched.get("week"))
+    except (TypeError, ValueError):
+        return 1
+
+
+async def week_games(week, played_only=True):
+    """[(franchise a, franchise b)] for one week from weeklyResults.
+    Each franchise dict has id, score, opt_pts, result. A team can appear twice
+    in a doubleheader week. played_only drops games where both scores are 0."""
+    d = await mfl.get("weeklyResults", max_age=300, W=str(week))
+    out = []
+    for m in as_list((d.get("weeklyResults") or {}).get("matchup")):
+        fr = as_list(m.get("franchise"))
+        if len(fr) != 2:
+            continue
+        if played_only and not (num(fr[0].get("score")) or num(fr[1].get("score"))):
+            continue
+        out.append((fr[0], fr[1]))
+    return out
+
+
+async def season_games(through_week):
+    """[(week, a, b)] for every played regular-season game through a week."""
+    league = (await mfl.get("league", max_age=3600))["league"]
+    last = min(int(through_week), int(league.get("lastRegularSeasonWeek") or 13))
+    out = []
+    for w in range(1, last + 1):
+        out += [(w, a, b) for a, b in await week_games(w)]
+    return out
+
+
+async def send_chunked(inter, title, blocks, footer=None, sep="\n"):
+    """Send text blocks as one or more gold embeds (4,096 chars each)."""
+    chunks, cur = [], ""
+    for b in blocks:
+        b = b[:3900]
+        if len(cur) + len(b) + len(sep) > 3900:
+            chunks.append(cur)
+            cur = ""
+        cur += b + sep
+    chunks.append(cur)
+    embeds = [discord.Embed(description=c, color=GOLD) for c in chunks]
+    embeds[0].title = title
+    embeds[0].url = LEAGUE_URL
+    if footer:
+        embeds[-1].set_footer(text=footer)
+    for e in embeds:                       # one embed per message (6,000-char limit)
+        await inter.followup.send(embed=e)
+
+
+# ---- /recap ------------------------------------------------------------------
+@tree.command(name="recap", description="Weekly recap: every result, high/low score, blowout, closest game, bench points")
+@app_commands.describe(week="Week to recap (leave blank for last week)")
+async def recap(inter: discord.Interaction, week: app_commands.Range[int, 1, 18] = None):
+    await inter.response.defer()
+    wk = week or max(1, await current_week() - 1)
+    games = await week_games(wk)
+    if not games:
+        await inter.followup.send(f"No results for week {wk} yet.")
+        return
+    teams = await mfl.teams()
+    name = lambda f: teams.get(f["id"], f["id"])
+
+    # Results, highest winning score first.
+    results = []
+    for a, b in games:
+        sa, sb = num(a.get("score")), num(b.get("score"))
+        w, l = (a, b) if sa >= sb else (b, a)
+        sw, sl = max(sa, sb), min(sa, sb)
+        verb = "tied" if sa == sb else "def."
+        results.append((sw, f"**{name(w)}** {sw:,.2f} {verb} {name(l)} {sl:,.2f} (+{sw - sl:,.2f})"))
+    results.sort(key=lambda x: x[0], reverse=True)
+
+    # Awards.
+    sides = [(f, num(f.get("score")), num(f.get("opt_pts"))) for g in games for f in g]
+    hi = max(sides, key=lambda x: x[1])
+    lo = min(sides, key=lambda x: x[1])
+    margins = [(abs(num(a.get("score")) - num(b.get("score"))), a, b) for a, b in games]
+    blow = max(margins, key=lambda x: x[0])
+    close = min(margins, key=lambda x: x[0])
+    bench = max(sides, key=lambda x: x[2] - x[1])
+    best_mgr = max(sides, key=lambda x: (x[1] / x[2]) if x[2] else 0)
+
+    def game_txt(m):
+        _, a, b = m
+        sa, sb = num(a.get("score")), num(b.get("score"))
+        w, l = (a, b) if sa >= sb else (b, a)
+        return f"{name(w)} over {name(l)} by **{m[0]:,.2f}**"
+
+    awards = [
+        f"🔥 **High score:** {name(hi[0])} — {hi[1]:,.2f}",
+        f"🧊 **Low score:** {name(lo[0])} — {lo[1]:,.2f}",
+        f"💥 **Biggest blowout:** {game_txt(blow)}",
+        f"😬 **Closest game:** {game_txt(close)}",
+        f"🪑 **Most points left on the bench:** {name(bench[0])} — "
+        f"{bench[2] - bench[1]:,.2f} (scored {bench[1]:,.2f} of a possible {bench[2]:,.2f})",
+        f"🧠 **Best lineup:** {name(best_mgr[0])} — {best_mgr[1] / best_mgr[2]:.1%} of possible points",
+    ]
+
+    # Players of the week (offense and IDP), with their fantasy owner.
+    d = await mfl.get("playerScores", max_age=600, W=str(wk), COUNT="400")
+    players = await mfl.players()
+    owners = await mfl.owners()
+    best = {}
+    idp = {"DE", "DT", "LB", "CB", "S"}
+    for r in as_list((d.get("playerScores") or {}).get("playerScore")):
+        p = players.get(r["id"])
+        if not p or p["pos"] in TEAM_POS:
+            continue
+        side = "IDP" if p["pos"] in idp else "Offense"
+        if side not in best or num(r.get("score")) > best[side][0]:
+            best[side] = (num(r.get("score")), r["id"], p)
+    for side in ("Offense", "IDP"):
+        if side in best:
+            pts, pid, p = best[side]
+            owner = teams.get(owners[pid][0], "?") if pid in owners else "🟢 FA"
+            awards.append(f"⭐ **{side} player of the week:** {p['name']} ({tag(p)}) — "
+                          f"{pts:,.2f} · {owner}")
+
+    embed = discord.Embed(title=f"📰 Week {wk} Recap", url=LEAGUE_URL, color=GOLD,
+                          description="\n".join(r for _, r in results)[:4096])
+    embed.add_field(name="🏅 Awards", value="\n".join(awards)[:1024], inline=False)
+    await inter.followup.send(embed=embed)
+
+
+# ---- /matchups ---------------------------------------------------------------
+@tree.command(name="matchups", description="This week's matchups with records, points, playoff seeds and live scores")
+@app_commands.describe(week="Week (leave blank for this week)")
+async def matchups(inter: discord.Interaction, week: app_commands.Range[int, 1, 18] = None):
+    await inter.response.defer()
+    wk = week or await current_week()
+    games = await week_games(wk, played_only=False)
+    if not games:
+        await inter.followup.send(f"No matchups found for week {wk}.")
+        return
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    division_of = {f["id"]: f.get("division") for f in as_list(league["franchises"]["franchise"])}
+    standings = as_list((await mfl.get("leagueStandings", max_age=600))["leagueStandings"]["franchise"])
+    row = {r["id"]: r for r in standings}
+    seeds, _ = playoff_picture(standings, division_of)
+    seed_of = {r["id"]: s for s, r, _ in seeds}
+    last_in = seeds[-1][1] if seeds else None
+    winners = {r["id"] for _, r, dw in seeds if dw}
+
+    def on_bubble(fid):
+        """Within about a game of the last playoff spot (in or out)."""
+        if not last_in or fid in winners or fid not in row:
+            return False
+        return abs(games_back(row[fid], last_in)) <= 1.5
+
+    def team_line(f):
+        r = row.get(f["id"], {})
+        s = seed_of.get(f["id"])
+        where = f"🎟️ #{s} seed" if s else "out of playoffs"
+        return (f"**{teams.get(f['id'], f['id'])}** · {record(r) if r else '?'} · "
+                f"{num(r.get('pf')):,.1f} PF · {num(r.get('pp')):,.1f} PP · {where}")
+
+    # Live scores for the current week (weeklyResults has no scores until the week is final).
+    live = {}
+    if wk == await current_week():
+        ls = await mfl.get("liveScoring", max_age=120, W=str(wk))
+        for m in as_list((ls.get("liveScoring") or {}).get("matchup")):
+            for f in as_list(m.get("franchise")):
+                live[f["id"]] = (num(f.get("score")), f.get("playersYetToPlay"))
+
+    embed = discord.Embed(title=f"🏈 Week {wk} Matchups", url=LEAGUE_URL, color=GOLD)
+    for a, b in games[:25]:
+        flags = []
+        if division_of.get(a["id"]) == division_of.get(b["id"]):
+            flags.append("⚔️ Division game")
+        if on_bubble(a["id"]) or on_bubble(b["id"]):
+            flags.append("🔥 Playoff race")
+        if a["id"] in live and b["id"] in live:
+            (sa, ya), (sb, yb) = live[a["id"]], live[b["id"]]
+            if sa or sb:
+                flags.append(f"Live {sa:,.2f} – {sb:,.2f} (yet to play: {ya} / {yb})")
+        else:
+            sa, sb = num(a.get("score")), num(b.get("score"))
+            if sa or sb:
+                flags.append(f"Final {sa:,.2f} – {sb:,.2f}")
+        value = team_line(a) + "\n" + team_line(b) + ("\n" + " · ".join(flags) if flags else "")
+        embed.add_field(name=f"{teams.get(a['id'], a['id'])} vs {teams.get(b['id'], b['id'])}",
+                        value=value[:1024], inline=False)
+    embed.set_footer(text="🔥 = a team within ~1 game of the last playoff spot · seeds per /playoffs")
+    await inter.followup.send(embed=embed)
+
+
+# ---- /powerrankings ----------------------------------------------------------
+@tree.command(name="powerrankings", description="Power rankings: all-play record, luck and recent form")
+async def powerrankings(inter: discord.Interaction):
+    await inter.response.defer()
+    through = max(1, await current_week() - 1)          # completed weeks only
+    games = await season_games(through)
+    if not games:
+        await inter.followup.send("No completed games yet.")
+        return
+    teams = await mfl.teams()
+    st = {}
+    by_week = {}
+    for w, a, b in games:
+        sa, sb = num(a.get("score")), num(b.get("score"))
+        for me, s1, s2 in ((a, sa, sb), (b, sb, sa)):
+            r = st.setdefault(me["id"], {"w": 0, "l": 0, "t": 0, "scores": [], "apw": 0, "apl": 0})
+            r["scores"].append((w, s1))
+            r["w" if s1 > s2 else "l" if s1 < s2 else "t"] += 1
+            by_week.setdefault(w, []).append((me["id"], s1))
+    # All-play: each week, your score vs every other team's score.
+    for w, lst in by_week.items():
+        for fid, s in lst:
+            st[fid]["apw"] += sum(1 for o, so in lst if o != fid and s > so)
+            st[fid]["apl"] += sum(1 for o, so in lst if o != fid and s < so)
+    last_wk = max(by_week)
+    recent_weeks = {last_wk - 2, last_wk - 1, last_wk}
+    rows = []
+    for fid, r in st.items():
+        g = len(r["scores"])
+        ap = r["apw"] / max(1, r["apw"] + r["apl"])
+        recent = [s for w, s in r["scores"] if w in recent_weeks]
+        rows.append({"fid": fid, "ap": ap, "apw": r["apw"], "apl": r["apl"],
+                     "rec": f"{r['w']}-{r['l']}" + (f"-{r['t']}" if r["t"] else ""),
+                     "luck": r["w"] - ap * g,
+                     "recent": sum(recent) / len(recent) if recent else 0.0})
+    rows.sort(key=lambda x: (x["ap"], x["recent"]), reverse=True)
+    lines = [f"{i}. **{teams.get(x['fid'], x['fid'])}** — all-play {x['apw']}-{x['apl']} "
+             f"({x['ap']:.3f}) · {x['rec']} · luck {x['luck']:+.1f} · last 3: {x['recent']:,.1f}/wk"
+             for i, x in enumerate(rows, 1)]
+    await send_chunked(inter, f"📊 Power Rankings — through Week {last_wk}", lines,
+                       footer="All-play = record if you played every team every week. "
+                              "Luck = actual wins minus all-play expected wins (+ = lucky). "
+                              "Last 3 = average score over the last 3 weeks.")
+
+
+# ---- /capspace ---------------------------------------------------------------
+@tree.command(name="capspace", description="Every team's salary cap room this season, most room first")
+async def capspace(inter: discord.Interaction):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    cap = money(league.get("salaryCapAmount"))
+    adj = await mfl.get("salaryAdjustments", max_age=600)
+    adjustments = {}
+    for a in as_list((adj.get("salaryAdjustments") or {}).get("salaryAdjustment")):
+        adjustments[a["franchise_id"]] = adjustments.get(a["franchise_id"], 0.0) + money(a.get("amount"))
+    rows = []
+    for fr in await mfl.rosters():
+        pay = team_payroll(fr, league, adjustments)
+        active = sum(1 for e in as_list(fr.get("player")) if e.get("status", "ROSTER") == "ROSTER")
+        rows.append((cap - pay, pay, active, fr["id"], adjustments.get(fr["id"], 0.0)))
+    rows.sort(reverse=True)
+    lines = []
+    for i, (room, pay, active, fid, dead) in enumerate(rows, 1):
+        flag = "🚨 " if room < 0 else ""
+        lines.append(f"{i}. {flag}**{teams.get(fid, fid)}** — "
+                     f"{'over by' if room < 0 else 'room'} **${abs(room):,.2f}** · "
+                     f"${pay:,.2f} used · {active}/{league.get('rosterSize')} active"
+                     + (f" · ${dead:,.2f} dead" if dead else ""))
+    await send_chunked(inter, f"💰 Cap Space — {YEAR} (cap ${cap:,.2f})", lines,
+                       footer="Cap used = active salaries + 25% of taxi/IR + dead money (matches MFL).")
+
+
+# ---- /capnextyear ------------------------------------------------------------
+@tree.command(name="capnextyear", description="Next season's cap after rollover: 20% raises, IR at 100%, expiring deals off")
+async def capnextyear(inter: discord.Interaction):
+    await inter.response.defer()
+    import pitboss_ai                        # rollover rates live with the AI calculators
+    raise_pct, cap_pct = pitboss_ai.SALARY_ESCALATION, pitboss_ai.CAP_ESCALATION
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    cap_next = round(money(league.get("salaryCapAmount")) * (1 + cap_pct), 2)
+    taxi_pct = money(league.get("includeTaxiWithSalary") or 100) / 100
+    rows = []
+    for fr in await mfl.rosters():
+        total, kept, expiring_sal, expiring_n = 0.0, 0, 0.0, 0
+        for e in as_list(fr.get("player")):
+            left = int(e["contractInfo"]) if str(e.get("contractInfo") or "").isdigit() else 0
+            sal = money(e.get("salary"))
+            if left - 1 < 1:                 # contract ends after this season
+                expiring_sal += sal
+                expiring_n += 1
+                continue
+            # Rollover: +20% salary; IR counts 100% (everyone leaves IR by April 1); taxi stays 25%.
+            pct = taxi_pct if e.get("status") == "TAXI_SQUAD" else 1.0
+            total += sal * (1 + raise_pct) * pct
+            kept += 1
+        rows.append((cap_next - total, total, kept, expiring_n, expiring_sal, fr["id"]))
+    rows.sort(reverse=True)
+    lines = []
+    for i, (room, total, kept, exp_n, exp_sal, fid) in enumerate(rows, 1):
+        flag = "🚨 " if room < 0 else ""
+        lines.append(f"{i}. {flag}**{teams.get(fid, fid)}** — "
+                     f"{'over by' if room < 0 else 'room'} **${abs(room):,.2f}** · "
+                     f"${total:,.2f} committed ({kept} players) · {exp_n} expiring (${exp_sal:,.2f} now)")
+    nxt = int(YEAR) + 1
+    await send_chunked(inter, f"🔮 {nxt} Cap Outlook (cap ${cap_next:,.2f})", lines,
+                       footer=f"Rollover per rule book: salaries +{raise_pct:.0%}, cap +{cap_pct:.0%}, "
+                              "IR players at 100%, taxi 25%, contracts with 1 year left drop off. "
+                              "Not included: next year's dead money, tags, holdouts, rookie picks.")
+
+
+# ---- /owneractivity (commissioners) -------------------------------------------
+INACTIVE_DAYS = 7          # flag owners who haven't visited MFL in this many days
+
+
+@tree.command(name="owneractivity", description="Commissioners: when each owner last visited the MFL site")
+@app_commands.default_permissions(manage_guild=True)   # admins only by default; change in Server Settings > Integrations
+async def owneractivity(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    teams = await mfl.teams()
+    if mfl.session is None:
+        mfl.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
+    url = f"{HOST}/fflnetdynamic{YEAR}/{LEAGUE_ID}_visitors.xml?random={int(time.time() // 60)}"
+    async with mfl.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        xml = await r.text()
+    seen = {}
+    for attrs in re.findall(r"<visit\s+([^>]*?)/>", xml):
+        a = dict(re.findall(r'(\w+)="([^"]*)"', attrs))
+        if a.get("franchise_id") in teams:
+            seen[a["franchise_id"]] = int(a.get("timestamp") or 0)
+    now = time.time()
+
+    def ago(ts):
+        mins = int((now - ts) // 60)
+        if mins < 60:
+            return f"{mins} min ago"
+        if mins < 48 * 60:
+            return f"{mins // 60} hr ago"
+        return f"{mins // 1440} days ago"
+
+    rows = sorted(((ts, fid) for fid, ts in seen.items()))        # longest away first
+    lines = [f"{'⚠️ ' if now - ts > INACTIVE_DAYS * 86400 else ''}**{teams[fid]}** — {ago(ts)}"
+             for ts, fid in rows]
+    never = [teams[fid] for fid in teams if fid not in seen]
+    lines += [f"⚠️ **{n}** — no recent visit recorded" for n in never]
+    inactive = sum(1 for ts, _ in rows if now - ts > INACTIVE_DAYS * 86400) + len(never)
+    embed = discord.Embed(title="👀 Owner Activity — last visit to MFL", color=GOLD,
+                          description="\n".join(lines)[:4096])
+    embed.set_footer(text=f"{inactive} owner(s) away more than {INACTIVE_DAYS} days (⚠️). "
+                          "Only you can see this reply.")
+    await inter.followup.send(embed=embed, ephemeral=True)
+
+
+# ---- /trades -----------------------------------------------------------------
+@tree.command(name="trades", description="Recent trades, plus how many trades each team has made this league year")
+@app_commands.describe(days="How many days back to list (default 14)")
+async def trades(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 14):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    players = await mfl.players()
+    d = await mfl.get("transactions", max_age=300, TRANS_TYPE="TRADE")    # whole league year
+    all_trades = [t for t in as_list((d.get("transactions") or {}).get("transaction"))
+                  if t.get("type") == "TRADE"]
+    cutoff = time.time() - days * 86400
+    recent = sorted((t for t in all_trades if int(t.get("timestamp") or 0) >= cutoff),
+                    key=lambda t: int(t.get("timestamp") or 0), reverse=True)
+    items = lambda s: [x for x in (s or "").split(",") if x]
+
+    blocks = []
+    for t in recent:
+        a, b = t.get("franchise"), t.get("franchise2")
+        when = datetime.fromtimestamp(int(t["timestamp"]), CENTRAL).strftime("%b %d")
+        gets_a = [bait_asset(x, players, teams) for x in items(t.get("franchise2_gave_up"))]
+        gets_b = [bait_asset(x, players, teams) for x in items(t.get("franchise1_gave_up"))]
+        lines = [f"**{when}** · {teams.get(a, a)} ⇄ {teams.get(b, b)}"
+                 + (" · *by commissioner*" if t.get("by_commish") == "1" else "")]
+        lines += [f"**{teams.get(a, a)}** gets:"] + [f"• {x}" for x in gets_a or ["nothing"]]
+        lines += [f"**{teams.get(b, b)}** gets:"] + [f"• {x}" for x in gets_b or ["nothing"]]
+        if t.get("comments"):
+            lines.append(f"📝 {t['comments']}")
+        blocks.append("\n".join(lines))
+    if not blocks:
+        blocks = [f"No trades in the last {days} days."]
+
+    # Season trade counts per team (every trade in MFL's league year).
+    count = {fid: 0 for fid in teams}
+    for t in all_trades:
+        for fid in (t.get("franchise"), t.get("franchise2")):
+            if fid in count:
+                count[fid] += 1
+    count_lines = [f"{i}. **{teams[fid]}** — {n}"
+                   for i, (fid, n) in enumerate(sorted(count.items(), key=lambda x: (-x[1], teams[x[0]].lower())), 1)]
+    await send_chunked(inter, f"🔁 Trades — last {days} days ({len(recent)})", blocks, sep="\n\n")
+    await send_chunked(inter, f"📈 Trades per team — {YEAR} league year ({len(all_trades)} total)",
+                       count_lines, footer="Counts every trade on MFL this league year, "
+                                           "including commissioner-processed ones.")
+
+
+# ---- Saturday lineup reminder (posts /rosteralerts automatically) -------------
+LINEUP_REMINDER_ON = True
+LINEUP_REMINDER_CHANNEL = "league-activity"   # channel name to post in
+LINEUP_REMINDER_DAY = 5                        # 0 = Monday ... 5 = Saturday
+LINEUP_REMINDER_HOUR = 19                      # 7 PM US Central
+REMINDER_STATE = HERE / "data" / "lineup_reminder.json"   # remembers the last post date
+
+
+def _reminder_last():
+    try:
+        return _json.loads(REMINDER_STATE.read_text()).get("last")
+    except Exception:
+        return None
+
+
+def _reminder_save(day):
+    REMINDER_STATE.parent.mkdir(exist_ok=True)
+    REMINDER_STATE.write_text(_json.dumps({"last": day}))
+
+
+async def post_lineup_reminder(force=False):
+    """Post Roster Alerts to LINEUP_REMINDER_CHANNEL. Returns how many channels got it."""
+    now = datetime.now(CENTRAL)
+    today = now.strftime("%Y-%m-%d")
+    if not force:
+        if (now.weekday() != LINEUP_REMINDER_DAY or now.hour != LINEUP_REMINDER_HOUR
+                or _reminder_last() == today):
+            return 0
+        league = (await mfl.get("league", max_age=3600))["league"]
+        if await current_week() > int(league.get("endWeek") or 17):
+            return 0                                   # season's over
+    embeds, found = await build_roster_report(None, include_lineups=True)
+    sent = 0
+    for guild in client.guilds:
+        ch = discord.utils.get(guild.text_channels, name=LINEUP_REMINDER_CHANNEL)
+        if not ch:
+            continue
+        intro = ("⏰ **Lineup check before Sunday's games!** Fix these before kickoff."
+                 if found else "⏰ **Lineup check:** every lineup looks good for Sunday. 👍")
+        await ch.send(intro)
+        for e in embeds:
+            await ch.send(embed=e)
+        sent += 1
+    if sent:
+        _reminder_save(today)
+    return sent
+
+
+@tasks.loop(minutes=5)
+async def lineup_reminder_loop():
+    try:
+        await post_lineup_reminder()
+    except Exception as e:                    # never let the loop die
+        print("Lineup reminder error:", repr(e))
+
+
+@lineup_reminder_loop.before_loop
+async def _wait_ready():
+    await client.wait_until_ready()
+
+
+@tree.command(name="lineupreminder", description="Commissioners: post the Saturday lineup reminder now")
+@app_commands.default_permissions(manage_guild=True)
+async def lineupreminder(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    n = await post_lineup_reminder(force=True)
+    await inter.followup.send(f"Posted to #{LINEUP_REMINDER_CHANNEL} in {n} server(s)." if n else
+                              f"Couldn't find a #{LINEUP_REMINDER_CHANNEL} channel.", ephemeral=True)
+
+
 @tree.error
 async def on_error(inter: discord.Interaction, error):
     print("Command error:", repr(error))
@@ -842,6 +1550,8 @@ async def on_ready():
     for guild in client.guilds:
         tree.copy_global_to(guild=guild)
         await tree.sync(guild=guild)
+    if LINEUP_REMINDER_ON and not lineup_reminder_loop.is_running():
+        lineup_reminder_loop.start()       # Saturday lineup reminder (see above)
     print(f"Pit Boss is online as {client.user} in {len(client.guilds)} server(s). "
           f"Leave this window open.")
 
