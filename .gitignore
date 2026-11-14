@@ -1,0 +1,9 @@
+# Secrets - never commit
+token.txt
+.env
+
+# Python clutter
+__pycache__/
+*.pyc
+.venv/
+venv/
