@@ -422,6 +422,207 @@ async def topscorers(inter: discord.Interaction, window: app_commands.Choice[str
     await inter.followup.send(embed=embed)
 
 
+# ---- /violationreport: illegal roster / lineup check for every team -----------
+# Injury statuses that mean "this player won't play" (Questionable/Doubtful are OK).
+NOT_PLAYING = {"Out", "IR", "IR-R", "IR-PUP", "IR-NFI", "Suspended", "RETIRED", "Holdout"}
+
+
+def parse_range(text):
+    """MFL limit text "2-3" -> (2, 3); "1" -> (1, 1)."""
+    lo, _, hi = str(text).partition("-")
+    return int(lo), int(hi or lo)
+
+
+def money(x):
+    try:
+        return float(x or 0)
+    except ValueError:
+        return 0.0
+
+
+def find_violations(league, rosters, adjustments, lineups, players, injuries, bye_check_teams):
+    """
+    Check every team against the league's rules. Pure function (no network),
+    so it is easy to test. Returns {franchise_id: [problem, ...]}.
+
+    league         - the "league" export (rosterSize, taxiSquad, injuredReserve,
+                     salaryCapAmount, includeTaxiWithSalary, includeIRWithSalary,
+                     rosterLimits, starters)
+    rosters        - list of franchises from the "rosters" export
+    adjustments    - {franchise_id: total salary adjustments (dead money)}
+    lineups        - {franchise_id: [starter ids]} for the week being checked
+    players        - mfl.players() dict
+    injuries       - {player_id: status}
+    bye_check_teams- set of NFL teams playing this week (empty = skip bye check)
+    """
+    max_active = int(league.get("rosterSize") or 0)
+    max_taxi = int(league.get("taxiSquad") or 0)
+    max_ir = int(league.get("injuredReserve") or 0)
+    cap = money(league.get("salaryCapAmount"))
+    # e.g. "25" = 25% of a taxi/IR player's salary counts toward the cap
+    taxi_pct = money(league.get("includeTaxiWithSalary") or 100) / 100
+    ir_pct = money(league.get("includeIRWithSalary") or 100) / 100
+
+    # Roster position limits; "0-0" means no limit in MFL.
+    pos_limits = {}
+    for p in as_list((league.get("rosterLimits") or {}).get("position")):
+        lo, hi = parse_range(p["limit"])
+        if hi > 0:
+            pos_limits[p["name"]] = (lo, hi)
+    starters_cfg = league.get("starters") or {}
+    start_total = int(starters_cfg.get("count") or 0)
+    start_limits = {p["name"]: parse_range(p["limit"])
+                    for p in as_list(starters_cfg.get("position"))}
+
+    def pname(pid):
+        p = players.get(pid)
+        return f"{p['name']} ({p['pos']}, {p['team'] or 'FA'})" if p else f"Player #{pid}"
+
+    out = {}
+    for fr in rosters:
+        fid, problems = fr["id"], []
+        entries = as_list(fr.get("player"))
+        status = {e["id"]: e.get("status", "ROSTER") for e in entries}
+        active = [e for e in entries if e.get("status", "ROSTER") == "ROSTER"]
+        taxi = [e for e in entries if e.get("status") == "TAXI_SQUAD"]
+        ir = [e for e in entries if e.get("status") == "INJURED_RESERVE"]
+
+        # --- Roster rules ---
+        if max_active and len(active) > max_active:
+            problems.append(f"🚨 Active roster has **{len(active)}** players (max {max_active})")
+        if max_taxi and len(taxi) > max_taxi:
+            problems.append(f"🚨 Taxi squad has **{len(taxi)}** players (max {max_taxi})")
+        if max_ir and len(ir) > max_ir:
+            problems.append(f"🚨 IR has **{len(ir)}** players (max {max_ir})")
+
+        payroll = (sum(money(e.get("salary")) for e in active)
+                   + taxi_pct * sum(money(e.get("salary")) for e in taxi)
+                   + ir_pct * sum(money(e.get("salary")) for e in ir)
+                   + adjustments.get(fid, 0.0))
+        if cap and payroll > cap + 0.005:
+            problems.append(f"🚨 Over the cap: **${payroll:,.2f}** (cap ${cap:,.2f}, "
+                            f"over by ${payroll - cap:,.2f})")
+
+        counts = {}
+        for e in active:
+            pos = players.get(e["id"], {}).get("pos", "?")
+            counts[pos] = counts.get(pos, 0) + 1
+        for pos, (lo, hi) in pos_limits.items():
+            n = counts.get(pos, 0)
+            if n > hi:
+                problems.append(f"🚨 Rosters **{n} {pos}** (max {hi})")
+            elif n < lo:
+                problems.append(f"🚨 Rosters **{n} {pos}** (min {lo})")
+
+        # --- This week's starting lineup ---
+        starters = lineups.get(fid)
+        if starters is not None:
+            if start_total and len(starters) != start_total:
+                problems.append(f"⚠️ Lineup has **{len(starters)}** starters "
+                                f"(needs {start_total})")
+            s_counts = {}
+            for pid in starters:
+                pos = players.get(pid, {}).get("pos", "?")
+                s_counts[pos] = s_counts.get(pos, 0) + 1
+            for pos, (lo, hi) in start_limits.items():
+                n = s_counts.get(pos, 0)
+                if n < lo or n > hi:
+                    allowed = f"{lo}" if lo == hi else f"{lo}-{hi}"
+                    problems.append(f"⚠️ Starting **{n} {pos}** (allowed {allowed})")
+            for pid in starters:
+                p = players.get(pid)
+                st = status.get(pid)
+                if st is None:
+                    problems.append(f"⚠️ Starting {pname(pid)} — not on this roster")
+                elif st == "TAXI_SQUAD":
+                    problems.append(f"⚠️ Starting {pname(pid)} — on the taxi squad")
+                elif st == "INJURED_RESERVE":
+                    problems.append(f"⚠️ Starting {pname(pid)} — on IR")
+                if p and p["team"] in ("", "FA"):
+                    problems.append(f"⚠️ Starting {pname(pid)} — not on an NFL team")
+                elif p and bye_check_teams and p["team"] not in bye_check_teams:
+                    problems.append(f"⚠️ Starting {pname(pid)} — on bye")
+                if injuries.get(pid) in NOT_PLAYING and st != "INJURED_RESERVE":
+                    problems.append(f"⚠️ Starting {pname(pid)} — **{injuries[pid]}**")
+
+        if problems:
+            out[fid] = problems
+    return out
+
+
+@tree.command(name="violationreport", description="Check every team for roster and lineup violations")
+@app_commands.describe(team="Optional: check just one team")
+@app_commands.autocomplete(team=team_autocomplete)
+async def violationreport(inter: discord.Interaction, team: str = None):
+    # Always the CURRENT week: MFL only gives today's rosters and injuries,
+    # so checking an old week's lineups would flag players traded since.
+    await inter.response.defer()
+    teams = await mfl.teams()
+    only = None
+    if team:
+        only = find_team(team, teams)
+        if not only:
+            await inter.followup.send(f"Couldn't find a team matching **{team}**.")
+            return
+
+    league = (await mfl.get("league", max_age=3600))["league"]
+    rosters = await mfl.rosters()
+    players = await mfl.players()
+
+    # Dead money / cap adjustments count toward the cap.
+    adj = await mfl.get("salaryAdjustments", max_age=600)
+    adjustments = {}
+    for a in as_list((adj.get("salaryAdjustments") or {}).get("salaryAdjustment")):
+        adjustments[a["franchise_id"]] = adjustments.get(a["franchise_id"], 0.0) + money(a.get("amount"))
+
+    # Current week, and which NFL teams play (anyone else is on bye).
+    sched = (await mfl.get("nflSchedule", max_age=600, host=API_HOST)).get("nflSchedule", {})
+    wk = sched.get("week", "")
+    playing = {t["id"] for m in as_list(sched.get("matchup")) for t in as_list(m.get("team"))}
+
+    # Submitted starting lineups for that week.
+    lineups = {}
+    wr = await mfl.get("weeklyResults", max_age=300, W=wk)
+    for m in as_list((wr.get("weeklyResults") or {}).get("matchup")):
+        for f in as_list(m.get("franchise")):
+            lineups[f["id"]] = [x for x in (f.get("starters") or "").split(",") if x]
+
+    inj = await mfl.get("injuries", max_age=1800, host=API_HOST)
+    injuries = {i["id"]: i.get("status", "")
+                for i in as_list((inj.get("injuries") or {}).get("injury"))}
+
+    if only:
+        rosters = [f for f in rosters if f["id"] == only]
+    found = find_violations(league, rosters, adjustments, lineups, players, injuries, playing)
+
+    scope = teams[only] if only else "All teams"
+    title = f"🚔 Violation Report — {scope} · Week {wk}"
+    if not found:
+        await inter.followup.send(embed=discord.Embed(
+            title=title, color=GOLD,
+            description="✅ No roster or lineup violations found."))
+        return
+
+    # One block per team, packed into as few embeds/messages as Discord allows.
+    blocks = [f"**{teams.get(fid, fid)}**\n" + "\n".join(f"• {p}" for p in probs)
+              for fid, probs in sorted(found.items(), key=lambda x: teams.get(x[0], x[0]).lower())]
+    embeds, cur = [], ""
+    for b in blocks:
+        b = b[:3900]
+        if len(cur) + len(b) + 2 > 3900:
+            embeds.append(cur)
+            cur = ""
+        cur += b + "\n\n"
+    embeds.append(cur)
+    embeds = [discord.Embed(description=e, color=GOLD) for e in embeds]
+    embeds[0].title = title
+    embeds[-1].set_footer(text=f"{len(found)} team(s) flagged · 🚨 roster rule · ⚠️ this week's lineup "
+                               "(lineups can still change before kickoff)")
+    # Discord allows ~6000 characters per message, so send one embed per message.
+    for i, e in enumerate(embeds):
+        await inter.followup.send(embed=e)
+
+
 @tree.error
 async def on_error(inter: discord.Interaction, error):
     print("Command error:", repr(error))
