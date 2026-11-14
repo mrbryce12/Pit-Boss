@@ -17,7 +17,7 @@ The people maintaining this are not professional developers. Keep code simple, s
 |---|---|---|
 | `pitboss.py` | **Transaction feed.** Polls MFL transactions and posts new trades and adds/drops/waiver wins to `#league-activity` via a Discord **webhook**. Standard library only. | GitHub Actions, every 15 min (`.github/workflows/pitboss.yml`) |
 | `state.json` | Feed's memory of already-posted transactions (hashes). Committed back to the repo by the workflow. **Don't delete or ignore it.** | written by the workflow |
-| `pitboss_bot.py` | **Slash-command bot** (`discord.py`): `/standings`, `/roster`, `/player`, `/stats`, `/topscorers`, `/violationreport`. Uses the Pit Boss bot account (Developer Portal application). | Always-on machine (currently Mike's Windows PC) |
+| `pitboss_bot.py` | **Slash-command bot** (`discord.py`): `/standings`, `/roster`, `/player`, `/stats`, `/topscorers`, `/rosteralerts`, `/rosterviolations`, `/playoffs`, `/potentialpoints`. Uses the Pit Boss bot account (Developer Portal application). | Always-on machine (currently Mike's Windows PC) |
 | `start_pitboss.bat` | Windows launcher: installs requirements, runs the bot, auto-restarts if it stops. | Windows PC |
 | `requirements.txt` | Python packages for the command bot. | |
 | `TODO.md` | Feature backlog. | |
@@ -40,12 +40,15 @@ Base: `{HOST}/{YEAR}/export?TYPE=<type>&L=27743&JSON=1` – public for this leag
 - `playerScores` (`W=YTD` or week number, `POSITION`, `COUNT`, `PLAYERS`): sorted desc; `isAvailable` = "1" for free agents.
 - `league` → `league.franchises.franchise[]` (id, name). `rosters` → `rosters.franchise[].player[]` (id, status ROSTER/TAXI_SQUAD/INJURED_RESERVE, salary, contractYear). `players` → names are `"Last, First"`.
 - A single result may come back as an object instead of a list – always normalize (`as_list`).
-- `nflSchedule` (`W=week`, blank = current week) must be fetched from `https://api.myfantasyleague.com` **without** `L=` (with `L=` it redirects to the league host, which refuses it). `matchup[]` → `kickoff` (Unix time), `team[]` (`id`, `isHome`). Used by `/topscorers` to map NFL teams to game windows (TNF, Sunday intl/early/late, SNF, MNF, other).
+- `nflSchedule` (`W=week`, blank = current week) must be fetched from `https://api.myfantasyleague.com` **without** `L=` (with `L=` it redirects to the league host, which refuses it). `matchup[]` → `kickoff` (Unix time), `team[]` (`id`, `isHome`). Used by `/topscorers` to map NFL teams to game windows (TNF, Sunday intl/early/late, SNF, MNF, other); it shows the top 5 per position in `SCORER_POS` (Team QB/K/P excluded).
 - Positions in this league: Team QB/K/P are `TMQB`/`TMPK`/`TMPN` (not QB/PK/PN). Some team names contain HTML `<font>` tags – `mfl.teams()` strips them.
 - League rules (from `league` export): `rosterSize` 45 (active only), `taxiSquad` 10, `injuredReserve` 20, `salaryCapAmount` 1795.90, `includeTaxiWithSalary`/`includeIRWithSalary` = 25 (% of taxi/IR salary that counts), `rosterLimits` (`"0-0"` = no limit; TMQB/TMPK/TMPN max 1), `starters` (21, per-position ranges), `partialLineupAllowed` NO.
 - Cap total = active salaries + 25% of taxi/IR salaries + `salaryAdjustments` (dead money) for the franchise. This matches MFL (several teams sit within $1 of the cap).
 - `weeklyResults` (`W`) → `matchup[].franchise[].starters` (comma list) = submitted lineup. `injuries` (current week) must come from `API_HOST`; statuses include Out, IR, IR-R, IR-PUP, IR-NFI, Suspended, RETIRED, Holdout, Questionable, Doubtful.
-- `/violationreport` only checks the **current** week – MFL rosters and injuries are "as of now", so past weeks would give false alarms.
+- `/rosteralerts` (roster + lineup, all teams) and `/rosterviolations` (illegal rosters, all teams) share `send_roster_report()` / `find_violations()`; passing `lineups={}` = roster rules only.
+- These reports only check the **current** week – MFL rosters and injuries are "as of now", so past weeks would give false alarms.
+- **Playoff format (league rule book §6, https://godfather-fantasy-football.ueniweb.com/about-us):** 12 teams, Weeks 14–17. Seeds 1–4 = the 4 division winners ordered by record (Week 14 bye); seeds 5–12 = next-best records; reseeded each round (highest seed plays lowest). Tiebreakers: we use MFL `leagueStandings` order (`standingsSort` = PCT, PTS, H2H, DIVPCT…). Note MFL's `playoffBrackets` export only shows an 8-team bracket starting Week 15 – the rule book is the source of truth. Divisions: `league.franchises.franchise[].division` → `league.divisions.division[]` (names like "Div 1 - SEC"); realigned every season.
+- **Draft lottery (rule book §14b):** non-playoff draft order is by Potential Points (`pp`); the 8 lowest-PP non-playoff teams (ranks 25–32) get 8,7,…,1 lottery balls for picks 1.01–1.08. `/potentialpoints` uses `playoff_picture()` to exclude teams currently in the playoffs.
 - Other useful exports for the backlog: `tradeBait`, `injuries`, `nflSchedule`, `schedule`, `rules`, `liveScoring`.
 - Send a descriptive User-Agent; don't poll faster than needed (cache 5–10 min).
 

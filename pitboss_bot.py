@@ -313,11 +313,10 @@ WINDOWS = {
     "other": "Other (Fri/Sat/Holiday)",
 }
 
-# Positions as this league names them (Team QB/K/P are TMQB/TMPK/TMPN),
-# plus two groups so you can ask for all offense or all IDP at once.
-LEAGUE_POS = ["RB", "WR", "TE", "TMQB", "TMPK", "TMPN", "DE", "DT", "LB", "CB", "S"]
-POS_GROUPS = {"OFFENSE": {"RB", "WR", "TE", "TMQB", "TMPK", "TMPN"},
-              "IDP": {"DE", "DT", "LB", "CB", "S"}}
+# Positions shown by /topscorers, in display order. Team QB/K/P
+# (TMQB/TMPK/TMPN) are left out on purpose.
+SCORER_POS = ["RB", "WR", "TE", "DE", "DT", "LB", "CB", "S"]
+TOP_N = 5  # players listed per position
 
 
 def game_window(kickoff_unix):
@@ -339,23 +338,12 @@ def game_window(kickoff_unix):
     return "other"             # Friday, Saturday, Christmas, etc.
 
 
-async def scorers_pos_autocomplete(_inter, current: str):
-    opts = ["OFFENSE", "IDP"] + LEAGUE_POS
-    return [app_commands.Choice(name=p, value=p)
-            for p in opts if current.lower() in p.lower()][:25]
-
-
-@tree.command(name="topscorers", description="Top fantasy scorers from one NFL game window")
+@tree.command(name="topscorers", description="Top 5 scorers at each position from one NFL game window")
 @app_commands.describe(window="Which games (TNF, Sunday early/late, SNF, MNF...)",
-                       week="NFL week (leave blank for the current week)",
-                       position="Optional: one position, OFFENSE, or IDP",
-                       count="How many players to show (default 10)")
+                       week="NFL week (leave blank for the current week)")
 @app_commands.choices(window=[app_commands.Choice(name=n, value=k) for k, n in WINDOWS.items()])
-@app_commands.autocomplete(position=scorers_pos_autocomplete)
 async def topscorers(inter: discord.Interaction, window: app_commands.Choice[str],
-                     week: app_commands.Range[int, 1, 18] = None,
-                     position: str = None,
-                     count: app_commands.Range[int, 1, 25] = 10):
+                     week: app_commands.Range[int, 1, 18] = None):
     await inter.response.defer()
 
     # 1. NFL schedule for the week -> which teams play in this window.
@@ -374,55 +362,49 @@ async def topscorers(inter: discord.Interaction, window: app_commands.Choice[str
         games.append(f"{away} @ {home}")
         teams_in_window.update(t["id"] for t in sides)
 
-    title = f"🔥 Top Scorers — Week {wk} · {window.name}"
     if not games:
         await inter.followup.send(f"No **{window.name}** games in week {wk}.")
         return
 
-    # 2. Which positions to include.
-    wanted = None
-    if position:
-        p = position.upper()
-        wanted = POS_GROUPS.get(p, {p})
-        title += f" · {p}"
-
-    # 3. Weekly scores, keeping only players whose NFL team played in the window.
+    # 2. Weekly scores, grouped by position, keeping only players whose NFL
+    #    team played in this window (and who actually scored).
     d = await mfl.get("playerScores", max_age=300, W=wk)
     players = await mfl.players()
-    rows = []
+    by_pos = {pos: [] for pos in SCORER_POS}
     for r in as_list(d.get("playerScores", {}).get("playerScore")):
         p = players.get(r["id"])
-        if not p or p["team"] not in teams_in_window:
-            continue
-        if wanted and p["pos"] not in wanted:
+        if not p or p["team"] not in teams_in_window or p["pos"] not in by_pos:
             continue
         try:
             pts = float(r.get("score") or 0)
         except ValueError:
             continue
-        rows.append((pts, r["id"], p))
-    rows.sort(key=lambda x: x[0], reverse=True)
-    rows = [x for x in rows if x[0] != 0][:count]
+        if pts != 0:
+            by_pos[p["pos"]].append((pts, r["id"], p))
 
-    embed = discord.Embed(title=title, color=GOLD)
-    embed.add_field(name="Games", value=", ".join(games)[:1024], inline=False)
-    if not rows:
-        embed.description = "No points scored yet — these games may not have started."
+    embed = discord.Embed(title=f"🔥 Top Scorers — Week {wk} · {window.name}",
+                          description="**Games:** " + ", ".join(games), color=GOLD)
+    if not any(by_pos.values()):
+        embed.description += "\n\nNo points scored yet — these games may not have started."
         await inter.followup.send(embed=embed)
         return
 
+    # 3. One section per position: top 5, highest first.
     teams = await mfl.teams()
     owners = await mfl.owners()
-    lines = []
-    for i, (pts, pid, p) in enumerate(rows, 1):
-        owner = teams.get(owners[pid][0], "?") if pid in owners else "🟢 FA"
-        lines.append(f"**{i}. {p['name']}** ({p['pos']}, {p['team']}) — "
-                     f"**{pts:.1f}** pts · {owner}")
-    embed.description = "\n".join(lines)
+    for pos in SCORER_POS:
+        rows = sorted(by_pos[pos], key=lambda x: x[0], reverse=True)[:TOP_N]
+        if not rows:
+            continue
+        lines = []
+        for i, (pts, pid, p) in enumerate(rows, 1):
+            owner = teams.get(owners[pid][0], "?") if pid in owners else "🟢 FA"
+            lines.append(f"{i}. **{p['name']}** ({p['team']}) — **{pts:.1f}** · {owner}")
+        embed.add_field(name=pos, value="\n".join(lines)[:1024], inline=False)
     await inter.followup.send(embed=embed)
 
 
-# ---- /violationreport: illegal roster / lineup check for every team -----------
+# ---- /rosteralerts: illegal roster / lineup check for every team ------------
 # Injury statuses that mean "this player won't play" (Questionable/Doubtful are OK).
 NOT_PLAYING = {"Out", "IR", "IR-R", "IR-PUP", "IR-NFI", "Suspended", "RETIRED", "Holdout"}
 
@@ -440,6 +422,19 @@ def money(x):
         return 0.0
 
 
+def team_payroll(fr, league, adjustments):
+    """Salary that counts against the cap for one franchise:
+    active salaries + the league's % of taxi/IR salaries + dead money."""
+    taxi_pct = money(league.get("includeTaxiWithSalary") or 100) / 100
+    ir_pct = money(league.get("includeIRWithSalary") or 100) / 100
+    total = adjustments.get(fr["id"], 0.0)
+    for e in as_list(fr.get("player")):
+        st = e.get("status", "ROSTER")
+        pct = taxi_pct if st == "TAXI_SQUAD" else ir_pct if st == "INJURED_RESERVE" else 1.0
+        total += pct * money(e.get("salary"))
+    return total
+
+
 def find_violations(league, rosters, adjustments, lineups, players, injuries, bye_check_teams):
     """
     Check every team against the league's rules. Pure function (no network),
@@ -450,7 +445,8 @@ def find_violations(league, rosters, adjustments, lineups, players, injuries, by
                      rosterLimits, starters)
     rosters        - list of franchises from the "rosters" export
     adjustments    - {franchise_id: total salary adjustments (dead money)}
-    lineups        - {franchise_id: [starter ids]} for the week being checked
+    lineups        - {franchise_id: [starter ids]} for the week being checked;
+                     pass {} to check roster rules only (no lineup checks)
     players        - mfl.players() dict
     injuries       - {player_id: status}
     bye_check_teams- set of NFL teams playing this week (empty = skip bye check)
@@ -459,9 +455,6 @@ def find_violations(league, rosters, adjustments, lineups, players, injuries, by
     max_taxi = int(league.get("taxiSquad") or 0)
     max_ir = int(league.get("injuredReserve") or 0)
     cap = money(league.get("salaryCapAmount"))
-    # e.g. "25" = 25% of a taxi/IR player's salary counts toward the cap
-    taxi_pct = money(league.get("includeTaxiWithSalary") or 100) / 100
-    ir_pct = money(league.get("includeIRWithSalary") or 100) / 100
 
     # Roster position limits; "0-0" means no limit in MFL.
     pos_limits = {}
@@ -495,10 +488,7 @@ def find_violations(league, rosters, adjustments, lineups, players, injuries, by
         if max_ir and len(ir) > max_ir:
             problems.append(f"🚨 IR has **{len(ir)}** players (max {max_ir})")
 
-        payroll = (sum(money(e.get("salary")) for e in active)
-                   + taxi_pct * sum(money(e.get("salary")) for e in taxi)
-                   + ir_pct * sum(money(e.get("salary")) for e in ir)
-                   + adjustments.get(fid, 0.0))
+        payroll = team_payroll(fr, league, adjustments)
         if cap and payroll > cap + 0.005:
             problems.append(f"🚨 Over the cap: **${payroll:,.2f}** (cap ${cap:,.2f}, "
                             f"over by ${payroll - cap:,.2f})")
@@ -550,12 +540,15 @@ def find_violations(league, rosters, adjustments, lineups, players, injuries, by
     return out
 
 
-@tree.command(name="violationreport", description="Check every team for roster and lineup violations")
-@app_commands.describe(team="Optional: check just one team")
-@app_commands.autocomplete(team=team_autocomplete)
-async def violationreport(inter: discord.Interaction, team: str = None):
-    # Always the CURRENT week: MFL only gives today's rosters and injuries,
-    # so checking an old week's lineups would flag players traded since.
+async def send_roster_report(inter, team=None, include_lineups=True):
+    """
+    Shared by /rosteralerts and /rosterviolations.
+    team=None checks all teams; passing a team checks just that one (and adds
+    its roster counts and cap room) – not used by a command right now.
+    include_lineups=False -> only true roster violations (limits, cap, position limits).
+    Always the CURRENT week: MFL only gives today's rosters and injuries,
+    so checking an old week's lineups would flag players traded since.
+    """
     await inter.response.defer()
     teams = await mfl.teams()
     only = None
@@ -580,33 +573,54 @@ async def violationreport(inter: discord.Interaction, team: str = None):
     wk = sched.get("week", "")
     playing = {t["id"] for m in as_list(sched.get("matchup")) for t in as_list(m.get("team"))}
 
-    # Submitted starting lineups for that week.
-    lineups = {}
-    wr = await mfl.get("weeklyResults", max_age=300, W=wk)
-    for m in as_list((wr.get("weeklyResults") or {}).get("matchup")):
-        for f in as_list(m.get("franchise")):
-            lineups[f["id"]] = [x for x in (f.get("starters") or "").split(",") if x]
-
-    inj = await mfl.get("injuries", max_age=1800, host=API_HOST)
-    injuries = {i["id"]: i.get("status", "")
-                for i in as_list((inj.get("injuries") or {}).get("injury"))}
+    lineups, injuries = {}, {}
+    if include_lineups:
+        # Submitted starting lineups for this week.
+        wr = await mfl.get("weeklyResults", max_age=300, W=wk)
+        for m in as_list((wr.get("weeklyResults") or {}).get("matchup")):
+            for f in as_list(m.get("franchise")):
+                lineups[f["id"]] = [x for x in (f.get("starters") or "").split(",") if x]
+        inj = await mfl.get("injuries", max_age=1800, host=API_HOST)
+        injuries = {i["id"]: i.get("status", "")
+                    for i in as_list((inj.get("injuries") or {}).get("injury"))}
 
     if only:
         rosters = [f for f in rosters if f["id"] == only]
     found = find_violations(league, rosters, adjustments, lineups, players, injuries, playing)
 
     scope = teams[only] if only else "All teams"
-    title = f"🚔 Violation Report — {scope} · Week {wk}"
+    if include_lineups:
+        title = f"🚔 Roster Alerts — {scope} · Week {wk}"
+        none_msg = "✅ No roster or lineup violations found."
+        legend = "🚨 roster rule · ⚠️ this week's lineup (lineups can still change before kickoff)"
+    else:
+        title = f"🚨 Roster Violations — {scope}"
+        none_msg = ("✅ Legal roster – within roster, taxi, IR, position and cap limits." if only else
+                    "✅ No illegal rosters. Every team is within roster, taxi, IR, position and cap limits.")
+        legend = "Roster rules only – see /rosteralerts for lineup issues"
+
+    # Single team: show where they stand, even when they're legal.
+    summary = ""
+    if only and rosters:
+        fr = rosters[0]
+        sts = [e.get("status", "ROSTER") for e in as_list(fr.get("player"))]
+        cap = money(league.get("salaryCapAmount"))
+        pay = team_payroll(fr, league, adjustments)
+        summary = (f"Active **{sts.count('ROSTER')}/{league.get('rosterSize')}** · "
+                   f"Taxi **{sts.count('TAXI_SQUAD')}/{league.get('taxiSquad')}** · "
+                   f"IR **{sts.count('INJURED_RESERVE')}/{league.get('injuredReserve')}**\n"
+                   f"Cap **${pay:,.2f} / ${cap:,.2f}** "
+                   f"({'over by' if pay > cap else 'room'} ${abs(cap - pay):,.2f})\n\n")
+
     if not found:
         await inter.followup.send(embed=discord.Embed(
-            title=title, color=GOLD,
-            description="✅ No roster or lineup violations found."))
+            title=title, color=GOLD, description=summary + none_msg))
         return
 
     # One block per team, packed into as few embeds/messages as Discord allows.
     blocks = [f"**{teams.get(fid, fid)}**\n" + "\n".join(f"• {p}" for p in probs)
               for fid, probs in sorted(found.items(), key=lambda x: teams.get(x[0], x[0]).lower())]
-    embeds, cur = [], ""
+    embeds, cur = [], summary
     for b in blocks:
         b = b[:3900]
         if len(cur) + len(b) + 2 > 3900:
@@ -616,11 +630,193 @@ async def violationreport(inter: discord.Interaction, team: str = None):
     embeds.append(cur)
     embeds = [discord.Embed(description=e, color=GOLD) for e in embeds]
     embeds[0].title = title
-    embeds[-1].set_footer(text=f"{len(found)} team(s) flagged · 🚨 roster rule · ⚠️ this week's lineup "
-                               "(lineups can still change before kickoff)")
+    embeds[-1].set_footer(text=f"{len(found)} team(s) flagged · {legend}")
     # Discord allows ~6000 characters per message, so send one embed per message.
-    for i, e in enumerate(embeds):
+    for e in embeds:
         await inter.followup.send(embed=e)
+
+
+@tree.command(name="rosteralerts", description="All teams: roster AND this week's lineup problems (bye, injured, short lineups)")
+async def rosteralerts(inter: discord.Interaction):
+    await send_roster_report(inter, None, include_lineups=True)
+
+
+@tree.command(name="rosterviolations", description="Illegal rosters only, all teams (roster/taxi/IR limits, cap, positions)")
+async def rosterviolations(inter: discord.Interaction):
+    await send_roster_report(inter, None, include_lineups=False)
+
+
+
+# ---- /playoffs: playoff picture if the season ended today -----------------
+# Blue Chip rules (league rule book, section 6):
+#   * 12 teams make it; playoffs are Weeks 14-17.
+#   * Seeds 1-4: the 4 division winners (best record in each division),
+#     ordered by record, and they get a Week 14 bye.
+#   * Seeds 5-12: the best remaining records.
+#   * Brackets are reseeded so the highest seed always plays the lowest.
+# Tiebreakers: we use MFL's own standings order (win %, points for,
+# head-to-head, ...), which is how the league is set up on MFL.
+PLAYOFF_TEAMS = 12
+DIVISION_WINNERS = 4   # = number of divisions; these get byes
+BUBBLE_SHOWN = 4       # teams listed as "first out"
+
+
+def wlt(row):
+    w, l, t = int(row.get("h2hw") or 0), int(row.get("h2hl") or 0), int(row.get("h2ht") or 0)
+    return w, l, t
+
+
+def record(row):
+    w, l, t = wlt(row)
+    return f"{w}-{l}" + (f"-{t}" if t else "")
+
+
+def games_back(row, target):
+    """Classic games-back: how far `row` trails `target` (ties count half)."""
+    w, l, t = wlt(row)
+    tw, tl, tt = wlt(target)
+    return ((tw - w) + (l - tl)) / 2
+
+
+def playoff_picture(standings, division_of):
+    """
+    standings   - leagueStandings rows, already in MFL's sorted order (best first)
+    division_of - {franchise_id: division id}
+    Returns (seeds, bubble): seeds = list of (seed, row, is_division_winner),
+    bubble = the next BUBBLE_SHOWN rows after the last playoff spot.
+    """
+    winners, seen = [], set()
+    for row in standings:                 # first team seen in each division = leader
+        div = division_of.get(row["id"])
+        if div not in seen:
+            seen.add(div)
+            winners.append(row)
+        if len(winners) == DIVISION_WINNERS:
+            break
+    winner_ids = {r["id"] for r in winners}
+    others = [r for r in standings if r["id"] not in winner_ids]
+    wild = others[:PLAYOFF_TEAMS - len(winners)]
+    seeds = [(i, r, True) for i, r in enumerate(winners, 1)]
+    seeds += [(i, r, False) for i, r in enumerate(wild, len(winners) + 1)]
+    bubble = others[len(wild):len(wild) + BUBBLE_SHOWN]
+    return seeds, bubble
+
+
+@tree.command(name="playoffs", description="Blue Chip playoff picture if the season ended today")
+async def playoffs(inter: discord.Interaction):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    division_of = {f["id"]: f.get("division")
+                   for f in as_list(league["franchises"]["franchise"])}
+    # Short division names: "Div 1 - SEC" -> "SEC"
+    div_name = {d["id"]: d.get("name", d["id"]).split(" - ")[-1]
+                for d in as_list((league.get("divisions") or {}).get("division"))}
+
+    d = await mfl.get("leagueStandings", max_age=600)
+    standings = as_list(d["leagueStandings"]["franchise"])
+    seeds, bubble = playoff_picture(standings, division_of)
+    if len(seeds) < PLAYOFF_TEAMS:
+        await inter.followup.send("Not enough teams in the standings to build a playoff picture yet.")
+        return
+
+    def line(seed, row):
+        name = teams.get(row["id"], row["id"])
+        div = div_name.get(division_of.get(row["id"]), "")
+        return (f"**{seed}. {name}** ({record(row)}) · "
+                f"{float(row.get('pf') or 0):,.1f} PF · {div}")
+
+    last_in = seeds[-1][1]
+    embed = discord.Embed(title="🏈 Blue Chip Playoff Picture — if the season ended today",
+                          url=LEAGUE_URL, color=GOLD)
+    embed.add_field(name="🏆 Division winners · Week 14 bye",
+                    value="\n".join(line(s, r) for s, r, _ in seeds[:DIVISION_WINNERS]),
+                    inline=False)
+    embed.add_field(name="🎟️ Wild cards",
+                    value="\n".join(line(s, r) for s, r, _ in seeds[DIVISION_WINNERS:]),
+                    inline=False)
+    # Week 14 wild-card round: 5v12, 6v11, 7v10, 8v9
+    wc = seeds[DIVISION_WINNERS:]
+    games = [f"({wc[i][0]}) {teams.get(wc[i][1]['id'], '?')} vs "
+             f"({wc[-1 - i][0]}) {teams.get(wc[-1 - i][1]['id'], '?')}"
+             for i in range(len(wc) // 2)]
+    embed.add_field(name="📅 Week 14 wild-card round", value="\n".join(games), inline=False)
+    if bubble:
+        out = []
+        for row in bubble:
+            gb = games_back(row, last_in)
+            gb_txt = "tied" if gb <= 0 else f"{gb:g} GB"
+            out.append(f"**{teams.get(row['id'], row['id'])}** ({record(row)}) · "
+                       f"{float(row.get('pf') or 0):,.1f} PF · {gb_txt}")
+        embed.add_field(name="🫧 First teams out (games back of the 12 seed)",
+                        value="\n".join(out), inline=False)
+    embed.set_footer(text="Division winners are seeds 1-4 by record; seeds 5-12 are the next-best records. "
+                          "Ties use MFL standings order (win %, points for, head-to-head). "
+                          "Reseeded each round.")
+    await inter.followup.send(embed=embed)
+
+
+# ---- /potentialpoints: PP rankings + draft lottery ------------------------
+# Blue Chip rules (league rule book, section 14b): draft order for non-playoff
+# teams is by Potential Points (PP). The 8 non-playoff teams with the LOWEST PP
+# (draft ranks 25-32) go into a weighted lottery for picks 1.01-1.08:
+#   lowest PP (rank 32) = 8 balls, next (31) = 7, ... rank 25 = 1 ball.
+LOTTERY_TEAMS = 8
+
+
+def lottery_balls(standings, playoff_ids):
+    """{franchise_id: balls} for the 8 lowest-PP teams that aren't in the playoffs."""
+    non_playoff = [r for r in standings if r["id"] not in playoff_ids]
+    lowest = sorted(non_playoff, key=lambda r: money(r.get("pp")))[:LOTTERY_TEAMS]
+    return {r["id"]: LOTTERY_TEAMS - i for i, r in enumerate(lowest)}
+
+
+@tree.command(name="potentialpoints", description="Potential Points for all teams + draft lottery balls")
+async def potentialpoints(inter: discord.Interaction):
+    await inter.response.defer()
+    teams = await mfl.teams()
+    league = (await mfl.get("league", max_age=3600))["league"]
+    division_of = {f["id"]: f.get("division")
+                   for f in as_list(league["franchises"]["franchise"])}
+    d = await mfl.get("leagueStandings", max_age=600)
+    standings = as_list(d["leagueStandings"]["franchise"])
+
+    # Who's in the playoffs today (same rules as /playoffs) - they can't be lottery teams.
+    seeds, _ = playoff_picture(standings, division_of)
+    seed_of = {r["id"]: s for s, r, _ in seeds}
+    balls = lottery_balls(standings, set(seed_of))
+    total_balls = sum(balls.values()) or 1
+
+    # All teams, highest PP first, one per line.
+    lines = []
+    for i, r in enumerate(sorted(standings, key=lambda r: money(r.get("pp")), reverse=True), 1):
+        name = teams.get(r["id"], r["id"])
+        tag = ""
+        if r["id"] in seed_of:
+            tag = f" · 🎟️ #{seed_of[r['id']]} seed"
+        elif r["id"] in balls:
+            n = balls[r["id"]]
+            tag = f" · 🎱 {n} lottery ball{'s' if n > 1 else ''}"
+        lines.append(f"{i}. **{name}** — {money(r.get('pp')):,.1f} PP · "
+                     f"{money(r.get('eff')):.1f}% eff · {record(r)}{tag}")
+
+    embed = discord.Embed(title="📈 Blue Chip Potential Points", url=LEAGUE_URL,
+                          description="\n".join(lines)[:4096], color=GOLD)
+
+    # Lottery block: worst PP first, with odds of landing the 1.01 pick.
+    lot = sorted(balls.items(), key=lambda x: x[1], reverse=True)
+    lot_lines = []
+    for fid, b in lot:
+        r = next(x for x in standings if x["id"] == fid)
+        lot_lines.append(f"🎱 **{b} ball{'s' if b > 1 else ''}** ({b / total_balls:.1%} for 1.01) — "
+                         f"**{teams.get(fid, fid)}** · {money(r.get('pp')):,.1f} PP")
+    if lot_lines:
+        embed.add_field(name="🎱 Draft lottery if the season ended today (picks 1.01–1.08)",
+                        value="\n".join(lot_lines)[:1024], inline=False)
+    embed.set_footer(text="PP = points with a perfect lineup; eff = actual ÷ potential. "
+                          "Lottery = 8 lowest-PP non-playoff teams (rule book §14b). "
+                          "🎟️ = in the playoffs today (/playoffs).")
+    await inter.followup.send(embed=embed)
 
 
 @tree.error
