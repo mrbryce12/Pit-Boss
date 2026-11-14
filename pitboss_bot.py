@@ -120,6 +120,9 @@ intents = discord.Intents.default()
 # Lets Pit Boss read the text of messages where he is tagged (incl. his role) or replied to.
 # Requires: Developer Portal > Pit Boss > Bot > "Message Content Intent" switched ON.
 intents.message_content = True
+# Lets Pit Boss see new members join so he can give them the starter role.
+# Requires: Developer Portal > Pit Boss > Bot > "Server Members Intent" switched ON.
+intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -1563,7 +1566,7 @@ pitboss_ai.setup(client, tree, mfl, globals())
 try:
     client.run(TOKEN)
 except discord.errors.PrivilegedIntentsRequired:
-    print("\n*** Pit Boss could not start: turn ON 'Message Content Intent' in the Discord "
-          "Developer Portal (your Pit Boss app > Bot > Privileged Gateway Intents), "
-          "click Save Changes, then restart. ***\n")
+    print("\n*** Pit Boss could not start: turn ON both 'Message Content Intent' and "
+          "'Server Members Intent' in the Discord Developer Portal (your Pit Boss app > Bot > "
+          "Privileged Gateway Intents), click Save Changes, then restart. ***\n")
 

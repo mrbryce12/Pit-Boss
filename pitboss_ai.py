@@ -59,6 +59,7 @@ RECENT_CONTEXT_MESSAGES = 12        # recent channel messages read when it is no
 RECENT_CONTEXT_MINUTES = 30         # ...only if they are this recent
 MAX_MEMORIES_IN_PROMPT = 150
 TRAINER_ROLE = "Pit Boss Trainer"
+NEW_MEMBER_ROLE = "Unknown"          # given automatically to everyone who joins ("" = off)
 SALARY_ESCALATION = 0.20            # league rollover: player salaries grow 20% a year (rule book 9k)
 CAP_ESCALATION = 0.05               # league rollover: the salary cap grows 5% every April 1 (rule 8d)
 # Rule book tiers (section 10 tags, section 12 holdouts): how many highest-paid players
@@ -510,6 +511,14 @@ TOOLS = [
      "description": "Find a team by ANY name it has ever had (teams rebrand): returns the franchise and its "
                     "name every season, including what it is called today. Use when a team name isn't found.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "league_champions",
+     "description": "OFFICIAL list of Blue Chip champions and runners-up for every season (MFL's League "
+                    "Champions record), with each franchise's name then and now, plus title counts.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "playoff_results",
+     "description": "Full playoff bracket results for a season: every round, seeds, scores, winners, the "
+                    "championship game and champion (plus any consolation brackets MFL tracks).",
+     "input_schema": {"type": "object", "properties": {"year": {"type": "integer"}}, "required": ["year"]}},
     {"name": "save_memory",
      "description": "Remember a lasting fact about the league or its people for future "
                     "conversations: nicknames, which Discord user owns which team, rivalries, "
@@ -2476,6 +2485,62 @@ class Brain:
                 f"{p['slot']} {p['name']} {p['pos']} {p['pts']:.1f}" for p in mine))
         return "\n".join(out)
 
+    async def league_champions(self):
+        b = self.bot
+        page = await self._page(f"{b['HOST']}/{b['YEAR']}/home/{b['LEAGUE_ID']}", 3600)
+        m = re.search(r'(?is)id="league_champions".*?</table>', page)
+        if not m:
+            return "Couldn't find the League Champions record on the league home page."
+        teams_now = await self.mfl.teams()
+        out, titles = [], {}
+        for year, body in re.findall(r'(?is)<th colspan="2">(\d{4})</th>(.*?)(?=<th colspan="2">\d{4}</th>|</table>)', m.group(0)):
+            places = re.findall(r'(?is)<td class="rank">(\d+)\.</td><td class="franchisename"><a href="[^"]*F=(\d+)">(.*?)</a>', body)
+            parts = []
+            for place, fid, name in places:
+                name = self._plain(name)
+                now = teams_now.get(fid, "")
+                label = name + (f" (now {now})" if now and now.strip().lower() != name.strip().lower() else "")
+                parts.append(f"{'Champion' if place == '1' else 'Runner-up' if place == '2' else place}: {label}")
+                if place == "1":
+                    titles[fid] = titles.get(fid, 0) + 1
+            out.append(f"{year}: " + "; ".join(parts))
+        multi = sorted(((n, fid) for fid, n in titles.items()), reverse=True)
+        out.append("Titles by franchise (current names): " + ", ".join(
+            f"{teams_now.get(fid, fid)} {n}" for n, fid in multi))
+        return "OFFICIAL Blue Chip champions (MFL League Champions record):\n" + "\n".join(out)
+
+    async def playoff_results(self, year):
+        y = int(year)
+        teams = await self._teams_in(y)
+        d = await self._hist(y, "playoffBrackets")
+        brackets = self.as_list((d.get("playoffBrackets") or {}).get("playoffBracket"))
+        if not brackets:
+            return f"No playoff brackets recorded for {y}."
+        out = []
+        for br in brackets:
+            bd = await self._hist(y, "playoffBracket", BRACKET_ID=br.get("id"))
+            rounds = self.as_list((bd.get("playoffBracket") or {}).get("playoffRound"))
+            out.append(f"{br.get('name', 'Playoffs')} ({y}):")
+            final = None
+            for i, rnd in enumerate(rounds, 1):
+                games = self.as_list(rnd.get("playoffGame"))
+                lines = []
+                for gm in games:
+                    h, a = gm.get("home", {}), gm.get("away", {})
+                    hp, ap = float(h.get("points") or 0), float(a.get("points") or 0)
+                    lab = lambda t: (f"({t['seed']}) " if t.get("seed") else "") + teams.get(t.get("franchise_id"), "?")
+                    if hp or ap:
+                        win, lose, wp, lp = (h, a, hp, ap) if hp >= ap else (a, h, ap, hp)
+                        lines.append(f"{lab(win)} {wp:.2f} def. {lab(lose)} {lp:.2f}")
+                        final = (win, lose, wp, lp)
+                    else:
+                        lines.append(f"{lab(h)} vs {lab(a)} (not played yet)")
+                name = "Championship" if i == len(rounds) and len(games) == 1 else f"Round {i}"
+                out.append(f"- Week {rnd.get('week')} {name}: " + "; ".join(lines))
+            if final and len(self.as_list(rounds[-1].get("playoffGame"))) == 1:
+                out.append(f"  {br.get('bracketWinnerTitle') or 'Champion'}: {teams.get(final[0].get('franchise_id'))}")
+        return "\n".join(out)
+
     async def run(self, name, args, ctx):
         if name == "save_memory":
             item = add_memory(args.get("fact", ""), ctx["author"], ctx["is_trainer"])
@@ -2533,6 +2598,8 @@ HOUSE_RULES = """
   'what if X beats Y': use what_if_playoffs (standings/bracket), team_salary options (cap), holdout_report
   through_week, or history tools. Label the answer as a what-if. Only refuse if no tool can model it,
   and then say what you CAN model instead.
+- Titles/champions/playoff history: ALWAYS check league_champions (official) and playoff_results before
+  answering or doubting anyone. Regular-season standings never decide who won the league.
 - Vetoes, overturned trades, rule changes and league votes: check league_polls AND message_board_search
   (e.g. words "veto" or "overturn") across seasons, then read the thread for the outcome. Compare vote
   counts to the rule-book threshold before saying whether something passed.
@@ -2759,6 +2826,22 @@ def setup(client, tree, mfl, bot_globals):
                   f"blocks={[b.type for b in resp.content]})")
         return reply or ("🎲 That one's too big for one hand. Narrow it down: one team, one "
                          "position, or one player.")
+
+    @client.event
+    async def on_member_join(member):
+        """Give every new member the starter role (NEW_MEMBER_ROLE)."""
+        if not NEW_MEMBER_ROLE or member.bot:
+            return
+        role = discord.utils.get(member.guild.roles, name=NEW_MEMBER_ROLE)
+        if role is None:
+            print(f"Auto-role: no role named '{NEW_MEMBER_ROLE}' in {member.guild.name}")
+            return
+        try:
+            await member.add_roles(role, reason="Pit Boss: new member starter role")
+            print(f"Auto-role: gave {member} the '{role.name}' role")
+        except discord.Forbidden:
+            print(f"Auto-role: can't give '{role.name}'. Give Pit Boss's role 'Manage Roles' and drag "
+                  f"it ABOVE '{role.name}' in Server Settings > Roles.")
 
     @client.event
     async def on_message(message):
