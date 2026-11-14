@@ -13,8 +13,11 @@ On a server, set the DISCORD_BOT_TOKEN environment variable instead.
 """
 
 import os
+import re
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -24,6 +27,8 @@ from discord import app_commands
 LEAGUE_ID = "27743"
 YEAR = "2026"
 HOST = "https://www48.myfantasyleague.com"
+API_HOST = "https://api.myfantasyleague.com"  # some exports (e.g. nflSchedule) only work here
+CENTRAL = ZoneInfo("America/Chicago")  # league times are shown in US Central
 LEAGUE_URL = f"{HOST}/{YEAR}/home/{LEAGUE_ID}"
 USER_AGENT = "PitBossDiscordBot/1.0 (Blue Chip league)"
 API_KEY = ""  # only needed if the league is ever made private
@@ -44,17 +49,19 @@ class MFL:
         self.session = None
         self.cache = {}  # key -> (time, data)
 
-    async def get(self, type_, max_age=300, **params):
-        key = (type_, tuple(sorted(params.items())))
+    async def get(self, type_, max_age=300, host=HOST, **params):
+        key = (host, type_, tuple(sorted(params.items())))
         hit = self.cache.get(key)
         if hit and time.time() - hit[0] < max_age:
             return hit[1]
         if self.session is None:
             self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
-        q = {"TYPE": type_, "L": LEAGUE_ID, "JSON": "1", **params}
+        q = {"TYPE": type_, "JSON": "1", **params}
+        if host == HOST:
+            q["L"] = LEAGUE_ID  # NFL-wide exports on API_HOST must NOT send a league id
         if API_KEY:
             q["APIKEY"] = API_KEY
-        async with self.session.get(f"{HOST}/{YEAR}/export", params=q,
+        async with self.session.get(f"{host}/{YEAR}/export", params=q,
                                     timeout=aiohttp.ClientTimeout(total=30)) as r:
             data = await r.json(content_type=None)
         self.cache[key] = (time.time(), data)
@@ -62,7 +69,9 @@ class MFL:
 
     async def teams(self):
         d = await self.get("league", max_age=86400)
-        return {f["id"]: f.get("name", f["id"])
+        # Some owners style their team name with HTML (e.g. <font color=...>);
+        # strip the tags so Discord shows plain text.
+        return {f["id"]: re.sub(r"<[^>]+>", "", f.get("name", f["id"])).strip() or f["id"]
                 for f in as_list(d["league"]["franchises"]["franchise"])}
 
     async def players(self):
@@ -290,6 +299,127 @@ async def stats(inter: discord.Interaction, position: str,
     title = f"📊 Top {pos}s — {label}" + (" (Free Agents)" if available_only else "")
     await inter.followup.send(embed=discord.Embed(title=title, description="\n".join(lines),
                                                   color=GOLD))
+
+
+# ---- /topscorers: best fantasy scores from one NFL game window -------------
+# Game windows, decided by each game's kickoff time in US Central.
+WINDOWS = {
+    "tnf": "Thursday Night",
+    "intl": "Sunday Morning (International)",
+    "early": "Sunday Early",
+    "late": "Sunday Late",
+    "snf": "Sunday Night",
+    "mnf": "Monday Night",
+    "other": "Other (Fri/Sat/Holiday)",
+}
+
+# Positions as this league names them (Team QB/K/P are TMQB/TMPK/TMPN),
+# plus two groups so you can ask for all offense or all IDP at once.
+LEAGUE_POS = ["RB", "WR", "TE", "TMQB", "TMPK", "TMPN", "DE", "DT", "LB", "CB", "S"]
+POS_GROUPS = {"OFFENSE": {"RB", "WR", "TE", "TMQB", "TMPK", "TMPN"},
+              "IDP": {"DE", "DT", "LB", "CB", "S"}}
+
+
+def game_window(kickoff_unix):
+    """Return the WINDOWS key for a game, from its kickoff (Unix seconds)."""
+    k = datetime.fromtimestamp(int(kickoff_unix), CENTRAL)
+    day, hour = k.strftime("%a"), k.hour
+    if day == "Thu":
+        return "tnf"
+    if day == "Mon":
+        return "mnf"
+    if day == "Sun":
+        if hour < 11:
+            return "intl"      # London/Germany/etc. games, ~8:30am CT
+        if hour < 14:
+            return "early"     # noon CT
+        if hour < 18:
+            return "late"      # 3:05 / 3:25 CT
+        return "snf"           # ~7:20pm CT
+    return "other"             # Friday, Saturday, Christmas, etc.
+
+
+async def scorers_pos_autocomplete(_inter, current: str):
+    opts = ["OFFENSE", "IDP"] + LEAGUE_POS
+    return [app_commands.Choice(name=p, value=p)
+            for p in opts if current.lower() in p.lower()][:25]
+
+
+@tree.command(name="topscorers", description="Top fantasy scorers from one NFL game window")
+@app_commands.describe(window="Which games (TNF, Sunday early/late, SNF, MNF...)",
+                       week="NFL week (leave blank for the current week)",
+                       position="Optional: one position, OFFENSE, or IDP",
+                       count="How many players to show (default 10)")
+@app_commands.choices(window=[app_commands.Choice(name=n, value=k) for k, n in WINDOWS.items()])
+@app_commands.autocomplete(position=scorers_pos_autocomplete)
+async def topscorers(inter: discord.Interaction, window: app_commands.Choice[str],
+                     week: app_commands.Range[int, 1, 18] = None,
+                     position: str = None,
+                     count: app_commands.Range[int, 1, 25] = 10):
+    await inter.response.defer()
+
+    # 1. NFL schedule for the week -> which teams play in this window.
+    #    (nflSchedule has to come from api.myfantasyleague.com, not our league host.)
+    params = {"W": str(week)} if week else {}
+    sched = await mfl.get("nflSchedule", max_age=600, host=API_HOST, **params)
+    sched = sched.get("nflSchedule", {})
+    wk = sched.get("week", str(week or "?"))
+    games, teams_in_window = [], set()
+    for m in as_list(sched.get("matchup")):
+        if game_window(m["kickoff"]) != window.value:
+            continue
+        sides = as_list(m.get("team"))
+        away = next((t["id"] for t in sides if t.get("isHome") == "0"), sides[0]["id"])
+        home = next((t["id"] for t in sides if t.get("isHome") == "1"), sides[-1]["id"])
+        games.append(f"{away} @ {home}")
+        teams_in_window.update(t["id"] for t in sides)
+
+    title = f"🔥 Top Scorers — Week {wk} · {window.name}"
+    if not games:
+        await inter.followup.send(f"No **{window.name}** games in week {wk}.")
+        return
+
+    # 2. Which positions to include.
+    wanted = None
+    if position:
+        p = position.upper()
+        wanted = POS_GROUPS.get(p, {p})
+        title += f" · {p}"
+
+    # 3. Weekly scores, keeping only players whose NFL team played in the window.
+    d = await mfl.get("playerScores", max_age=300, W=wk)
+    players = await mfl.players()
+    rows = []
+    for r in as_list(d.get("playerScores", {}).get("playerScore")):
+        p = players.get(r["id"])
+        if not p or p["team"] not in teams_in_window:
+            continue
+        if wanted and p["pos"] not in wanted:
+            continue
+        try:
+            pts = float(r.get("score") or 0)
+        except ValueError:
+            continue
+        rows.append((pts, r["id"], p))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    rows = [x for x in rows if x[0] != 0][:count]
+
+    embed = discord.Embed(title=title, color=GOLD)
+    embed.add_field(name="Games", value=", ".join(games)[:1024], inline=False)
+    if not rows:
+        embed.description = "No points scored yet — these games may not have started."
+        await inter.followup.send(embed=embed)
+        return
+
+    teams = await mfl.teams()
+    owners = await mfl.owners()
+    lines = []
+    for i, (pts, pid, p) in enumerate(rows, 1):
+        owner = teams.get(owners[pid][0], "?") if pid in owners else "🟢 FA"
+        lines.append(f"**{i}. {p['name']}** ({p['pos']}, {p['team']}) — "
+                     f"**{pts:.1f}** pts · {owner}")
+    embed.description = "\n".join(lines)
+    await inter.followup.send(embed=embed)
 
 
 @tree.error

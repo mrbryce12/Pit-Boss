@@ -17,7 +17,7 @@ The people maintaining this are not professional developers. Keep code simple, s
 |---|---|---|
 | `pitboss.py` | **Transaction feed.** Polls MFL transactions and posts new trades and adds/drops/waiver wins to `#league-activity` via a Discord **webhook**. Standard library only. | GitHub Actions, every 15 min (`.github/workflows/pitboss.yml`) |
 | `state.json` | Feed's memory of already-posted transactions (hashes). Committed back to the repo by the workflow. **Don't delete or ignore it.** | written by the workflow |
-| `pitboss_bot.py` | **Slash-command bot** (`discord.py`): `/standings`, `/roster`, `/player`, `/stats`. Uses the Pit Boss bot account (Developer Portal application). | Always-on machine (currently Mike's Windows PC) |
+| `pitboss_bot.py` | **Slash-command bot** (`discord.py`): `/standings`, `/roster`, `/player`, `/stats`, `/topscorers`. Uses the Pit Boss bot account (Developer Portal application). | Always-on machine (currently Mike's Windows PC) |
 | `start_pitboss.bat` | Windows launcher: installs requirements, runs the bot, auto-restarts if it stops. | Windows PC |
 | `requirements.txt` | Python packages for the command bot. | |
 | `TODO.md` | Feature backlog. | |
@@ -40,6 +40,8 @@ Base: `{HOST}/{YEAR}/export?TYPE=<type>&L=27743&JSON=1` – public for this leag
 - `playerScores` (`W=YTD` or week number, `POSITION`, `COUNT`, `PLAYERS`): sorted desc; `isAvailable` = "1" for free agents.
 - `league` → `league.franchises.franchise[]` (id, name). `rosters` → `rosters.franchise[].player[]` (id, status ROSTER/TAXI_SQUAD/INJURED_RESERVE, salary, contractYear). `players` → names are `"Last, First"`.
 - A single result may come back as an object instead of a list – always normalize (`as_list`).
+- `nflSchedule` (`W=week`, blank = current week) must be fetched from `https://api.myfantasyleague.com` **without** `L=` (with `L=` it redirects to the league host, which refuses it). `matchup[]` → `kickoff` (Unix time), `team[]` (`id`, `isHome`). Used by `/topscorers` to map NFL teams to game windows (TNF, Sunday intl/early/late, SNF, MNF, other).
+- Positions in this league: Team QB/K/P are `TMQB`/`TMPK`/`TMPN` (not QB/PK/PN). Some team names contain HTML `<font>` tags – `mfl.teams()` strips them.
 - Other useful exports for the backlog: `tradeBait`, `injuries`, `nflSchedule`, `schedule`, `rules`, `liveScoring`.
 - Send a descriptive User-Agent; don't poll faster than needed (cache 5–10 min).
 
