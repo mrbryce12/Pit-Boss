@@ -258,3 +258,154 @@ Several ideas reuse the same pieces. Build each once:
 **Data:** everything comes from MFL exports Pit Boss already reads: `weeklyResults` (per-player starter points), `transactions` (adds, trades, dates), `playerScores` by week, and `leagueStandings`. Discord stats come from `data/usage.json`, plus the opt-in message counts.
 
 **Effort:** 3–4 evenings. The stats are straightforward; the image cards take the most polish. A text-only version could ship in an evening.
+
+---
+
+## Blue Chip Hall of Fame (annual induction vote)
+
+*Parked Nov 15, 2026.*
+
+**What:** a yearly ballot where the league votes owners and NFL players into a Blue Chip Hall of Fame, with an induction "ceremony" around the rookie draft. This goes beyond a static history channel: the vote is the event.
+
+**Two wings**
+- **GM wing (owners):** for long careers and great runs in Blue Chip.
+- **Player wing (NFL players):** for players who carried Blue Chip teams.
+
+**Eligibility (committee to finalize)**
+- GMs: at least 5 seasons in Blue Chip, plus a title, a runner-up finish, or a standout record. Former owners are eligible too.
+- Players: retired from the NFL, or at least 8 seasons of Blue Chip history, among the top scorers at their position in league history.
+
+**How the vote works**
+1. **Nominations (2 weeks, after the championship):** any owner nominates in #hall-of-fame or with `/hofnominate`.
+2. **Ballot:** the committee sets the final ballot, with up to ~10 names per wing.
+3. **Fact sheets:** Pit Boss builds one for each nominee from league history, using what `pitboss_ai.py` already has: `history_standings`, `league_champions`, `player_career`, `draft_grade` and `team_lookup` (records, titles, playoff trips, career points in Blue Chip, best seasons).
+4. **Voting (1 week):** `/hofvote` shows the ballot privately. Owners pick up to 3 per wing, and votes are stored without being shown publicly. Discord's built-in polls show who voted for what, so they don't suit a secret ballot.
+5. **Induction:** 66% or more gets in, with at most 3 per wing per year. Anyone under 5% drops off future ballots.
+6. **Ceremony:** an induction post with a plaque-style card, a permanent "Hall of Famer" role for GMs, and a pinned entry in #hall-of-fame. The new class could be introduced live on draft night.
+
+**Storage:** `data/hall_of_fame.json` (nominees, ballots, inductees by year).
+
+**Effort:** 1–2 evenings. The fact sheets reuse existing history tools.
+
+---
+
+## League mock rookie drafts
+
+*Parked Nov 15, 2026.*
+
+**What:** two or three practice rookie drafts in Discord before the real Blue Chip rookie draft, using the real projected draft order. It's off-season activity that sparks trade talk ("I'd move up for him").
+
+**Timing:** after the NFL Draft (late April), when rookies have NFL teams in MFL, and before the Blue Chip rookie draft.
+
+**How it works**
+1. **`/mockdraft start` (admins):** creates a thread in #pit-boss-reports with the draft order from `projected_draft_order` (the lottery picks can be simulated or left as "lottery TBD"), and a pick clock.
+2. **Two speeds:**
+   - **Slow mock:** about 4 hours per pick, so owners can pick whenever they check in.
+   - **Live mock:** 2 minutes per pick, scheduled as a Discord Event.
+3. **Picking:** `/mockpick player:<name>`, with autocomplete limited to rookies (from the MFL `players` export, filtered by draft year). Pit Boss posts a pick card with position, NFL team and college.
+4. **No-shows:** if the clock runs out, Pit Boss auto-picks the best available rookie by MFL ADP (`adp` export) or a simple ranking, so nobody stalls the mock.
+5. **Results:** a full board at the end, a "steals and reaches" summary versus ADP, and a comparison against the real draft afterward ("the league's mock nailed 1.01").
+
+**Settings:** pick timer, number of rounds (all 6, or just round 1), and whether owners can trade picks during the mock (version 2).
+
+**Storage:** `data/mock_drafts/<date>.json`.
+
+**Effort:** 2 evenings.
+
+---
+
+## End-of-season owner survey
+
+*Parked Nov 15, 2026.*
+
+**What:** an anonymous survey every year right after the championship, while the season is fresh, followed by a public summary and a committee response. It directly supports the transparency promise in the Discord announcement.
+
+**How it works**
+1. **The questions (about 10–12, kept the same each year so trends show):**
+   - Overall satisfaction (1–5) and "would you recommend Blue Chip?" (0–10)
+   - Communication and transparency from the committee (1–5)
+   - Rules: anything confusing or unfair? Scoring, cap or contract changes to consider?
+   - Discord and Pit Boss: what's useful, what's noise, and what's missing?
+   - Trade activity and the trade deadline
+   - Open text: one thing to keep, one thing to change
+2. **Collecting answers anonymously:** either
+   - **Google Form (simplest):** Pit Boss posts the link and tracks who has *said* they finished, never their answers; or
+   - **`/survey` in Pit Boss:** questions arrive privately in Discord. Pit Boss records *that* an owner responded, so it can remind non-responders, but saves answers without names.
+3. **Reminders:** Pit Boss pings owners who haven't responded every few days, up to the deadline (needs the owner directory from `/iam`).
+4. **Results:** Pit Boss summarizes the numbers and the common themes in the open answers. The committee posts the summary in #announcements, plus a "You said, we're doing" list.
+5. **Year over year:** results are kept in `data/surveys/<year>.json`, so the next summary can show "communication score up from 3.1 to 4.0."
+
+**Effort:** an evening with a Google Form; 2 evenings for the private Pit Boss version.
+
+---
+
+## Off-season side contests (with Pit Boss reminders)
+
+*Parked Nov 15, 2026.*
+
+**What:** light off-season competitions for bragging rights, with Pit Boss doing the chasing so commissioners don't have to.
+
+**Contest options**
+- **NFL Draft prediction contest (football, fully automatic):** owners predict the first-round picks (players and/or positions) with `/draftpicks` before the NFL Draft. Pit Boss scores them from MFL's player data after the draft and posts a leaderboard. *Confirm what draft details the MFL `players` export provides (e.g. draft round and pick) before building.*
+- **March Madness bracket:** run on an outside site (e.g. an ESPN Tournament Challenge group). Pit Boss posts the group link and the deadline. A trainer marks who has joined with `/contest joined @owner`, and Pit Boss reminds everyone else. Standings come from the outside site.
+- **Preseason predictions:** before Week 1, owners predict division winners, the champion and the #1 lottery pick. Pit Boss locks the picks and scores them at season's end, which is fun to revisit in Wrapped.
+
+**How the reminders work**
+1. **`/contest create` (admins):** name, link (if any), deadline, and how entries are tracked (automatic or marked by trainers).
+2. **Reminders:** 3 days, 1 day and 2 hours before the deadline, Pit Boss pings only the owners who haven't entered (needs `/iam`).
+3. **Leaderboard and results:** posted in #league-chat. The winner could get a trophy role for the year (see Trophy roles).
+
+**Storage:** `data/contests.json`.
+
+**Effort:** an evening for the contest and reminders framework; another evening for the automatic NFL Draft scoring.
+
+---
+
+## Weekly "Taskmaster" challenges
+
+*Parked Nov 15, 2026.*
+
+**What:** a silly side challenge every week, scored separately from the real standings, with a season leaderboard. It keeps eliminated teams engaged, because anyone can win a week.
+
+**How it works**
+1. **Thursday morning:** Pit Boss posts the week's challenge in #league-chat (drawn from a list, never repeating in a season).
+2. **Tuesday:** Pit Boss scores it automatically from MFL data and posts the winner with the weekly recap. 3 points for the winner, 2 for second, 1 for third.
+3. **`/taskmaster`:** shows the season leaderboard. The season winner gets a "Taskmaster" role for the next year.
+
+**Example challenges (all computable from MFL data Pit Boss already reads)**
+- Most points from players earning under $5 (`rosters` salary plus `weeklyResults` starter points)
+- Highest-scoring IDP starter
+- Most points from rookies
+- Best lineup efficiency: actual ÷ optimal (`score` / `opt_pts`)
+- Most points from players on your taxi squad last week who were promoted
+- Highest-scoring player picked up as a free agent this season
+- Closest to exactly 200.00 points
+- Most points from players at least 30 years old
+- Biggest win margin by an underdog (by MFL `spread`)
+- Most points from a single NFL team's players
+
+**Rules:** only starters count, unless the challenge says otherwise. Ties split the points. The challenge is announced before kickoff so nobody can game it after the fact.
+
+**Storage:** `data/taskmaster.json` (the challenge list, weekly results, the season table).
+
+**Effort:** 1–2 evenings. Each challenge is a small function; start with 10 and add more over time.
+
+---
+
+## Spoiler channels and conversation summaries (Discord features)
+
+*Parked Nov 15, 2026.*
+
+**What:** two newer Discord features that need no code, just setup.
+
+**Conversation summaries**
+- Discord can summarize busy channels, so owners can catch up on a long #lets-deal or #league-chat thread without reading hundreds of messages.
+- Setup: check whether summaries are available for the server (Server Settings, or the channel's summary button). Availability has varied by region and server type, so confirm before announcing.
+- Good for: #lets-deal, #league-chat, #rule-change-discussion, and game-day threads.
+
+**Spoiler channels**
+- A channel can be set so every message is hidden until clicked.
+- Good for: the AI recap or Wrapped before the official reveal, a draft-night channel for owners watching on delay, or a "results" thread for owners who want to watch games before seeing scores.
+- Setup: channel settings → spoiler option, if available on the server. Confirm in Discord, since this is a newer feature.
+
+**Effort:** minutes for an admin. Add a line to the Discord guide once they're on.
