@@ -1594,14 +1594,21 @@ async def post_lineup_reminder(force=False):
         ch = discord.utils.get(guild.text_channels, name=LINEUP_REMINDER_CHANNEL)
         if not ch:
             continue
+        perms = ch.permissions_for(guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            print(f"Lineup reminder: no permission to post in #{ch.name} on {guild.name} - skipped")
+            continue
         intro = ("⏰ **Lineup check before Sunday's games!** Fix these before kickoff."
                  if found else "⏰ **Lineup check:** every lineup looks good for Sunday. 👍")
-        await ch.send(intro)
-        for e in embeds:
-            await ch.send(embed=e)
-        sent += 1
-    if sent:
-        _reminder_save(today)
+        try:
+            await ch.send(intro)
+            for e in embeds:
+                await ch.send(embed=e)
+            sent += 1
+        except discord.Forbidden as e:
+            print(f"Lineup reminder: Discord refused #{ch.name} on {guild.name}: {e}")
+    if not force:
+        _reminder_save(today)        # one try per Saturday, even if a server refused (no repeat posts)
     return sent
 
 
