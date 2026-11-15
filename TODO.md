@@ -18,7 +18,7 @@ Status key: ⬜ to do · 🔄 in progress · ✅ done
 - ✅ AI chat: @Pit Boss answers questions (live MFL data, rule book, trade opinions, NFL chat), persona file, learns via trainer-approved memories (was backlog #9 rules + #8 trade opinions, partial)
 - ✅ AI calculators: cap/next-season rollover, tags, holdouts, salary tiers, scoring stats, power rankings/luck, records, head-to-head, positional strength, trade math, league cap table, what-if playoffs
 - ✅ AI league info: start/sit (RotoWire + Ourlads), message board, public chat, owner activity, history 2014+, future picks, projected draft order
-- ✅ AI ops: one AI channel, 5 questions/day per person (trainers exempt), owner directory (`/iam`), channel memory for follow-ups
+- ✅ AI ops: one AI channel, 8 questions/day per person (trainers exempt), owner directory (`/iam`), channel memory for follow-ups
 
 ## Backlog
 | # | Item | Status | Notes |

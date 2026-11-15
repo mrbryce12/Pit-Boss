@@ -52,7 +52,7 @@ MAX_OUTPUT_TOKENS = 4000            # hard ceiling per answer (includes thinking
 MAX_TOOL_ROUNDS = 6                 # how many lookups it can chain per question
 DAILY_REQUEST_LIMIT = 300           # whole server, resets at midnight Central
 USER_COOLDOWN_SECONDS = 8           # per person, stops spam
-USER_DAILY_LIMIT = 5                # questions per person per day (0 = no limit)
+USER_DAILY_LIMIT = 8                # questions per person per day (0 = no limit)
 TRAINERS_UNLIMITED = True           # trainers skip the per-person limit
 REPLY_CHAIN_DEPTH = 8               # earlier messages read for context
 RECENT_CONTEXT_MESSAGES = 12        # recent channel messages read when it is not a reply
