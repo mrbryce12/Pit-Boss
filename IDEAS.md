@@ -41,6 +41,33 @@ Owners bet fake chips on Blue Chip matchups, and Pit Boss acts as the house.
 
 ---
 
-## Considered and passed on
+## Linked Roles (MFL-verified owner role)
 
-- **Linked Roles** (auto-give The Final Table role to MFL-verified owners). Passed Nov 15, 2026: it needs a public web page, the commissioner's MFL API key and an email-matching fallback, which isn't worth it for 32 owners the admins already know.
+*Parked Nov 15, 2026. Low priority: admins already know all 32 owners, so the main gain is not having to hand out roles and having verified team ownership instead of self-declared `/iam`.*
+
+Discord gives an owner a role automatically once Pit Boss confirms they own an MFL team.
+
+**How it works for an owner**
+1. In Discord: server menu → **Linked Roles** → click **The Final Table**.
+2. Discord opens a small Pit Boss web page, where the owner approves "Pit Boss can see your account."
+3. Pit Boss checks MFL. If the person owns a team, it tells Discord "verified owner of [team]."
+4. Discord gives the role. No admin step.
+
+**Verifying MFL ownership (never ask for MFL passwords)**
+- First choice, email match: Discord OAuth (`identify email` scopes) gives the owner's verified email, and the `league` export read with the commissioner's MFL API key includes each franchise owner's email. If they match, the owner is verified. *Check first that the API key really returns owner emails for this league.*
+- Fallback when emails differ: Pit Boss shows a short code, the owner puts it in their MFL team profile or league chat, and Pit Boss checks for it. A committee member can also approve someone by hand.
+
+**What to build**
+1. **Role connection metadata.** Register once via the Discord API: `verified_owner` (yes/no), `seasons_in_league` (number), `championships` (number).
+2. **Verification web endpoint.** Discord requires a public HTTPS "Linked Roles Verification URL" and an OAuth2 redirect. The bot PC isn't reachable from the internet, so use a free tunnel (e.g. Cloudflare Tunnel) or a small free web host.
+3. **The ownership check:** email match first, then the code fallback. On success, `PUT /users/@me/applications/{app_id}/role-connection` with the metadata.
+4. **Discord settings (an admin, no code):**
+   - Developer Portal → General Information: set the Linked Roles Verification URL.
+   - OAuth2: add the redirect, and keep the client secret off GitHub.
+   - Server Settings → Roles → **The Final Table** → Links: add the requirement "Pit Boss: verified owner = true."
+
+**Bonus roles from the same data:** Champion (championships ≥ 1), OG (seasons ≥ 10), and division roles, all updating automatically. It would also replace `/iam` with verified ownership.
+
+**Needs:** the commissioner's MFL API key (kept on the bot machine like `token.txt`), a hosting choice (tunnel vs. free host), and Developer Portal access.
+
+**Effort:** a few evenings. Build as `pitboss_linkedroles.py`, hooked into the bot the way `pitboss_ai.py` is.
