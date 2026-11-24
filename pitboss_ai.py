@@ -323,11 +323,28 @@ TOOLS = [
          "count": {"type": "integer", "description": "How many (max 25)"}},
          "required": ["position"]}},
     {"name": "recent_transactions",
-     "description": "Recent league trades, adds/drops, blind-bid waiver wins and IR moves.",
+     "description": "Last few days of league trades, adds/drops, blind-bid wins and IR moves (max 60 days). For older moves, week ranges or rankings use transaction_search.",
      "input_schema": {"type": "object", "properties": {
          "days": {"type": "integer", "description": "How many days back (default 7, max 60)"},
          "team": {"type": "string", "description": "Optional: only this team"},
          "trades_only": {"type": "boolean"}}}},
+    {"name": "transaction_search",
+     "description": "FULL transaction history for ANY season 2014-now (this season included, back to "
+                    "the start of the league year): adds, drops, blind-bid wins with $, trades, IR and taxi "
+                    "moves. Filter by kind, team, player, NFL week range (from_week/to_week) or dates. "
+                    "with_points=true adds each added player's fantasy points from the week he was added "
+                    "through to_week, and sort='points' ranks the best pickups. Use this instead of "
+                    "recent_transactions for anything older than a few weeks or any week range.",
+     "input_schema": {"type": "object", "properties": {
+         "year": {"type": "integer", "description": "Omit for this season"},
+         "kind": {"type": "string", "enum": ["all", "adds", "drops", "trades", "ir", "taxi"]},
+         "team": {"type": "string"}, "player": {"type": "string"},
+         "from_week": {"type": "integer"}, "to_week": {"type": "integer"},
+         "from_date": {"type": "string", "description": "YYYY-MM-DD"},
+         "to_date": {"type": "string", "description": "YYYY-MM-DD"},
+         "with_points": {"type": "boolean"},
+         "sort": {"type": "string", "enum": ["date", "points"]},
+         "limit": {"type": "integer", "description": "default 60, max 150"}}}},
     {"name": "trade_bait",
      "description": "Players each team has listed on the MFL trading block, and what they want.",
      "input_schema": {"type": "object", "properties": {}}},
@@ -892,15 +909,47 @@ class Brain:
         d = await self.mfl.get("leagueStandings", max_age=600)
         standings = self.as_list(d["leagueStandings"]["franchise"])
         seeds, bubble = self.bot["playoff_picture"](standings, division_of)
+        pf = lambda r: float(r.get("pf") or 0)
         lines = []
         for seed, r, is_div in seeds:
-            lines.append(f"Seed {seed}: {teams.get(r['id'])} ({r.get('h2hwlt')})"
+            lines.append(f"Seed {seed}: {teams.get(r['id'])} ({r.get('h2hwlt')}, {pf(r):,.2f} PF)"
                          + (" - division winner, bye" if is_div else ""))
         last = seeds[-1][1] if seeds else None
-        for r in bubble:
+        for i, r in enumerate(bubble, 1):
             gb = self.bot["games_back"](r, last) if last else "?"
-            lines.append(f"Out: {teams.get(r['id'])} ({r.get('h2hwlt')}), {gb} games back")
+            lines.append(f"Out #{i}: {teams.get(r['id'])} ({r.get('h2hwlt')}, {pf(r):,.2f} PF), {gb} games back")
+        lines.append("\n" + await self._tiebreak_notes([r for _, r, _ in seeds] + list(bubble), teams))
         return "\n".join(lines)
+
+    def _pct(self, wlt):
+        try:
+            w, l, t = (list(map(int, str(wlt).split("-"))) + [0, 0, 0])[:3]
+        except ValueError:
+            return 0.0
+        g = w + l + t
+        return (w + 0.5 * t) / g if g else 0.0
+
+    async def _tiebreak_notes(self, rows, teams):
+        """Explain, per the Godfather Common Rule Book, how teams with the same record are ordered."""
+        out = ["Tiebreakers (Godfather Common Rule Book, same for standings, playoff spots and waiver order): "
+               "#1 win %, #2 total points scored, #3 head-to-head (only for a 2-team tie; skipped for 3+), "
+               "#4 division win %, #5 power rank. MFL's standings already apply them in this order, so the "
+               "listed order IS the tiebreaker order."]
+        groups = {}
+        for r in rows:
+            groups.setdefault(round(self._pct(r.get("h2hwlt")), 4), []).append(r)
+        for g in groups.values():
+            if len(g) < 2:
+                continue
+            names = [teams.get(r["id"], r["id"]) for r in g]
+            pts = [float(r.get("pf") or 0) for r in g]
+            if len(set(pts)) == len(pts):
+                order = ", ".join(f"{n} ({p:,.2f})" for n, p in zip(names, pts))
+                out.append(f"- Tied at {g[0].get('h2hwlt')}: decided by #2 total points scored -> {order}.")
+            else:
+                out.append(f"- Tied at {g[0].get('h2hwlt')} AND equal points: {', '.join(names)} - goes to "
+                           + ("#3 head-to-head." if len(g) == 2 else "#4 division win % (head-to-head skipped, 3+ teams)."))
+        return "\n".join(out)
 
     async def team_roster(self, team):
         fid, teams = await self._team_id(team)
@@ -1828,6 +1877,165 @@ class Brain:
             out.append(line)
         return f"{year} {'trades' if trades_only else 'transactions'}:\n" + ("\n".join(out[:80]) or "None found.")
 
+    # -- Full transaction search: any season, any week range, with points --
+    async def _week_ends(self, year):
+        """{week: unix time the week's last game kicks off + 4h} from the NFL schedule."""
+        cache = self.__dict__.setdefault("_week_end_cache", {})
+        if year in cache:
+            return cache[year]
+        ends = {}
+        for w in range(1, 19):
+            try:
+                url = f"{self.bot['API_HOST']}/{year}/export?TYPE=nflSchedule&W={w}&JSON=1"
+                d = json.loads(await self._page(url, 86400))
+                kos = [int(m.get("kickoff") or 0) for m in self.as_list((d.get("nflSchedule") or {}).get("matchup"))]
+                if kos and max(kos):
+                    ends[w] = max(kos) + 4 * 3600
+            except Exception:
+                continue
+        cache[year] = ends
+        return ends
+
+    async def transaction_search(self, year=None, kind="all", team=None, player=None,
+                                 from_week=None, to_week=None, from_date=None, to_date=None,
+                                 with_points=False, sort="date", limit=60):
+        cur = int(self.bot["YEAR"])
+        year = int(year or cur)
+        if year == cur:
+            d = await self.mfl.get("transactions", max_age=600)
+            teams = await self.mfl.teams()
+            players = {pid: (p["name"], p["pos"], p["team"]) for pid, p in (await self.mfl.players()).items()}
+        else:
+            d = await self._hist(year, "transactions")
+            teams, players = await self._hist_names(year)
+        txns = self.as_list((d.get("transactions") or {}).get("transaction"))
+        fid = self.bot["find_team"](team, teams) if team else None
+        if team and not fid:
+            return f"No team matches '{team}'."
+        ends = await self._week_ends(year)
+
+        def week_of(ts):
+            ws = sorted(ends)
+            if not ws or ts < ends[ws[0]] - 7 * 86400:
+                return None                   # offseason, before Week 1 waivers
+            for w in ws:
+                if ts <= ends[w]:
+                    return w
+            return None                       # after the season
+        def day(s):
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=self.bot["CENTRAL"]).timestamp()
+            except Exception:
+                return None
+        lo, hi = day(from_date) if from_date else None, day(to_date) if to_date else None
+        if hi:
+            hi += 86400
+        ids = lambda s: [x for x in (s or "").split(",") if x]
+        def nm(a):
+            if a.startswith("FP_"):
+                _, fr, yr, rd = a.split("_")
+                return f"{yr} rd {rd} pick ({teams.get(fr, fr)})"
+            if a.startswith("DP_"):
+                _, rd, pk = a.split("_")
+                return f"{year} pick {int(rd) + 1}.{int(pk) + 1:02d}"
+            if a.startswith("BB_"):
+                return f"${a[3:]} blind-bid $"
+            p = players.get(a)
+            return f"{p[0]} ({p[1]} {p[2]})" if p else f"Player #{a}"
+        kind = (kind or "all").lower()
+        rows = []          # (ts, week, text, added_ids, team)
+        for t in txns:
+            typ = t.get("type", "")
+            if typ in ("LOCK_ALL_PLAYERS", "UNLOCK_ALL_PLAYERS", "BBID_AUTO_PROCESS_WAIVERS"):
+                continue
+            ts = int(t.get("timestamp") or 0)
+            if (lo and ts < lo) or (hi and ts >= hi):
+                continue
+            wk = week_of(ts)
+            if from_week and (wk is None or wk < int(from_week)):
+                continue
+            if to_week and (wk is None or wk > int(to_week)):
+                continue
+            if fid and fid not in (t.get("franchise"), t.get("franchise2")):
+                continue
+            a = teams.get(t.get("franchise"), t.get("franchise"))
+            added = []
+            if typ == "TRADE":
+                if kind not in ("all", "trades"):
+                    continue
+                b = teams.get(t.get("franchise2"), t.get("franchise2"))
+                text = (f"TRADE: {a} gets {', '.join(map(nm, ids(t.get('franchise2_gave_up')))) or '-'}"
+                        f" | {b} gets {', '.join(map(nm, ids(t.get('franchise1_gave_up')))) or '-'}")
+            elif typ == "IR":
+                if kind not in ("all", "ir"):
+                    continue
+                text = (f"IR: {a} to IR {', '.join(map(nm, ids(t.get('deactivated')))) or '-'}"
+                        f", off IR {', '.join(map(nm, ids(t.get('activated')))) or '-'}")
+            elif typ == "TAXI":
+                if kind not in ("all", "taxi"):
+                    continue
+                text = (f"TAXI: {a} promoted {', '.join(map(nm, ids(t.get('promoted')))) or '-'}"
+                        f", demoted {', '.join(map(nm, ids(t.get('demoted')))) or '-'}")
+            else:
+                parts = (t.get("transaction") or "").split("|")
+                added = [x for x in ids(parts[0]) if x.isdigit()] if parts else []
+                dropped = ids(parts[-1]) if len(parts) > 1 else []
+                bid = parts[1] if typ == "BBID_WAIVER" and len(parts) > 2 else ""
+                if kind == "adds" and not added:
+                    continue
+                if kind == "drops" and not dropped:
+                    continue
+                if kind in ("trades", "ir", "taxi"):
+                    continue
+                if kind == "drops":
+                    added = []
+                bits = []
+                if added and kind != "drops":
+                    bits.append("added " + ", ".join(map(nm, added)) + (f" (${bid})" if bid else ""))
+                if dropped and kind != "adds":
+                    bits.append("dropped " + ", ".join(map(nm, dropped)))
+                if not bits:
+                    continue
+                text = f"{typ}: {a} " + "; ".join(bits)
+            if player and player.lower() not in text.lower():
+                continue
+            rows.append((ts, wk, text, added, t.get("franchise")))
+        if not rows:
+            return f"No matching {year} transactions."
+
+        pts_note = ""
+        if with_points and any(r[3] for r in rows):
+            last = int(to_week or max((w for w in ends if ends[w] < time.time()), default=0) or 18)
+            weekly = {}
+            first = min((r[1] or 1) for r in rows if r[3])
+            for w in range(max(1, first), last + 1):
+                weekly[w] = await self._week_scores(w, year)
+            scored = []
+            for r in rows:
+                start = max(1, r[1] or 1, int(from_week or 1))
+                pts = {pid: sum(weekly.get(w, {}).get(pid, 0.0) for w in range(start, last + 1)) for pid in r[3]}
+                tot = sum(pts.values())
+                text = r[2] + "  -> " + ", ".join(f"{nm(p).split(' (')[0]} {v:.1f} pts" for p, v in pts.items())
+                scored.append((r[0], r[1], text, r[3], r[4], tot))
+            rows = scored
+            pts_note = (f" Points = that player's fantasy points from the week he was added through week {last} "
+                        f"(all of those weeks, whoever rostered him later).")
+        if sort == "points" and with_points:
+            rows.sort(key=lambda r: -r[5])
+        else:
+            rows.sort(key=lambda r: -r[0])
+        n = max(1, min(int(limit or 60), 150))
+        lines = []
+        for r in rows[:n]:
+            when = datetime.fromtimestamp(r[0], self.bot["CENTRAL"]).strftime("%b %d")
+            wk = f"wk {r[1]}" if r[1] else "offseason"
+            lines.append(f"- {when} ({wk}) {r[2]}")
+        head = (f"{year} transactions ({kind}{', ' + teams.get(fid, fid) if fid else ''}"
+                f"{f', weeks {from_week or 1}-{to_week or chr(8230)}' if (from_week or to_week) else ''}): "
+                f"{len(rows)} found, showing {min(n, len(rows))}. Week = NFL week the move happened in "
+                f"(a move counts for the week whose games it came before; offseason = before Week 1 waivers or after the season).{pts_note}")
+        return head + "\n" + "\n".join(lines)
+
     # -- What-if standings & playoffs: replay any week, add hypothetical results --
     async def what_if_playoffs(self, through_week=None, wins_out=None, results=None):
         """Rebuild standings from weekly results (weeks 1..through_week), optionally add
@@ -1905,7 +2113,7 @@ class Brain:
 
         title = (f"WHAT-IF: standings through week {played_through}" if (through_week or not (wins_out or results))
                  else "WHAT-IF")
-        out = [f"{title} (rebuilt from weekly results; ties broken by win % then points for)"]
+        out = [f"{title} (rebuilt from weekly results; ties broken by win % then total points, per the rule book)"]
         if notes:
             out.append("Assumptions: " + " ".join(notes))
         out.append("Seeds:")
@@ -1921,7 +2129,8 @@ class Brain:
         if bubble and seeds:
             last = seeds[-1][1]
             out.append("First teams out: " + "; ".join(
-                f"{teams.get(r['id'])} ({r['h2hwlt']}, {self.bot['games_back'](r, last):g} GB)" for r in bubble))
+                f"{teams.get(r['id'])} ({r['h2hwlt']}, {float(r['pf']):,.1f} PF, {self.bot['games_back'](r, last):g} GB)" for r in bubble))
+        out.append(await self._tiebreak_notes([r for _, r, _ in seeds] + list(bubble or []), teams))
         return "\n".join(out)
 
     # -- Scoring stats calculator: averages / totals by position, any week range --
@@ -3134,6 +3343,17 @@ HOUSE_RULES = """
   If they are wrong, tell them so, with the receipts.
 - Things you've learned (approved memories) and commissioner notes OVERRIDE your own reading of
   the rule book or tool output when they conflict, and say you are applying the league's ruling.
+- Tiebreakers (standings, playoff spots, waiver order, draft order among playoff teams): Godfather
+  Common Rule Book order is #1 win %, #2 total points scored, #3 head-to-head (2-team ties only),
+  #4 division win %, #5 power rank. playoff_picture and what_if_playoffs show the points and which
+  step breaks each tie: always say WHY a tied team is ahead (e.g. "same 6-5, but 40 more points").
+  Non-playoff draft order uses potential points, then these same tiebreakers. Playoff GAME ties use
+  the playoff-game tiebreakers in the common rule book (total yards, total TDs, longest TD...).
+  Never say the tool doesn't show the tiebreaker order.
+- Transactions: for any question about pickups, adds, drops, trades or IR moves beyond the last
+  few days, or by week range, or "best pickups", use transaction_search (whole season, every season
+  since 2014, with_points for points scored). Never say the history only goes back 60 days.
+  For points in any week range use scoring_stats or transaction_search with_points, never season totals.
 - Memories: each learned fact has a #number. Pit Boss Trainers can tell you to fix or delete one:
   use fix_memory / delete_memory (trainers only), or save_memory for something new. NEVER say you
   saved, changed or deleted anything unless the tool result in THIS conversation says it happened,
